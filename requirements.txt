@@ -1,0 +1,9 @@
+anthropic
+langchain
+chromadb
+pymupdf
+python-docx
+python-dotenv
+fastapi
+uvicorn
+tiktoken
