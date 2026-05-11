@@ -1,51 +1,71 @@
-import chromadb
-from typing import Optional
+import faiss
+import numpy as np
+import json
+import os
+from sentence_transformers import SentenceTransformer
 
 
 class VectorStore:
-    def __init__(self, persist_dir: str = "./.chroma"):
-        self.client = chromadb.PersistentClient(path=persist_dir)
+    def __init__(self, persist_dir: str = "./.faiss_store"):
+        self.persist_dir = persist_dir
+        os.makedirs(persist_dir, exist_ok=True)
+        self.model = SentenceTransformer("all-MiniLM-L6-v2")
+        self.indexes = {}
+        self.chunks = {}
 
-    def ingest(self, chunks: list[dict], collection_name: str) -> None:
-        collection = self.client.get_or_create_collection(name=collection_name)
+    def ingest(self, chunks: list, collection_name: str) -> int:
+        texts = [c["text"] for c in chunks]
+        embeddings = self.model.encode(texts, show_progress_bar=False)
+        embeddings = embeddings.astype("float32")
 
-        ids = []
-        documents = []
-        metadatas = []
+        embedding_dim = embeddings.shape[1]
+        index = faiss.IndexFlatL2(embedding_dim)
+        index.add(embeddings)
 
-        for chunk in chunks:
-            ids.append(chunk["chunk_id"])
-            documents.append(chunk["text"])
-            metadatas.append(
-                {
-                    "source_file": chunk["source_file"],
-                    "page_number": chunk.get("page_number"),
-                    "char_count": str(chunk["char_count"]),
-                }
-            )
+        self.indexes[collection_name] = index
+        self.chunks[collection_name] = chunks
 
-        collection.add(ids=ids, documents=documents, metadatas=metadatas)
+        index_path = os.path.join(self.persist_dir, f"{collection_name}.index")
+        chunks_path = os.path.join(self.persist_dir, f"{collection_name}.json")
 
-    def search(self, query: str, collection_name: str, n_results: int = 5) -> list[dict]:
-        collection = self.client.get_collection(name=collection_name)
+        faiss.write_index(index, index_path)
+        with open(chunks_path, "w") as f:
+            json.dump(chunks, f)
 
-        results = collection.query(query_texts=[query], n_results=n_results)
+        return len(chunks)
 
-        search_results = []
-        for i in range(len(results["ids"][0])):
-            search_results.append(
-                {
-                    "chunk_id": results["ids"][0][i],
-                    "text": results["documents"][0][i],
-                    "metadata": results["metadatas"][0][i],
-                    "distance": results["distances"][0][i],
-                }
-            )
+    def search(self, query: str, collection_name: str, n_results: int = 5) -> list:
+        if collection_name not in self.indexes:
+            self._load(collection_name)
 
-        return search_results
+        if collection_name not in self.indexes:
+            return []
 
-    def clear(self, collection_name: str) -> None:
-        try:
-            self.client.delete_collection(name=collection_name)
-        except Exception:
-            pass
+        q_emb = self.model.encode([query])
+        q_emb = q_emb.astype("float32")
+
+        D, I = self.indexes[collection_name].search(q_emb, n_results)
+
+        chunks = self.chunks[collection_name]
+        return [chunks[i] for i in I[0] if i < len(chunks)]
+
+    def _load(self, collection_name: str):
+        index_path = os.path.join(self.persist_dir, f"{collection_name}.index")
+        chunks_path = os.path.join(self.persist_dir, f"{collection_name}.json")
+
+        if os.path.exists(index_path) and os.path.exists(chunks_path):
+            self.indexes[collection_name] = faiss.read_index(index_path)
+            with open(chunks_path, "r") as f:
+                self.chunks[collection_name] = json.load(f)
+
+    def clear(self, collection_name: str):
+        self.indexes.pop(collection_name, None)
+        self.chunks.pop(collection_name, None)
+
+        index_path = os.path.join(self.persist_dir, f"{collection_name}.index")
+        chunks_path = os.path.join(self.persist_dir, f"{collection_name}.json")
+
+        if os.path.exists(index_path):
+            os.remove(index_path)
+        if os.path.exists(chunks_path):
+            os.remove(chunks_path)
