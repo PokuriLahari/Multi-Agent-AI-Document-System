@@ -1,7 +1,8 @@
 import streamlit as st
 import streamlit.components.v1 as components
-import os, uuid, time, json
+import os, uuid, json
 from pathlib import Path
+from textwrap import dedent
 from pipeline.chunker import chunk_document
 from pipeline.embedder import VectorStore
 from agents.orchestrator import OrchestratorAgent
@@ -24,15 +25,32 @@ st.set_page_config(
     initial_sidebar_state="collapsed"
 )
 
-st.session_state.setdefault('vector_store', VectorStore())
-st.session_state.setdefault('orchestrator', OrchestratorAgent())
+if not check_ollama_running():
+    st.error("Alert: Ollama is not running. Open a terminal and run:  ollama serve")
+    st.stop()
+
+if 'vector_store' not in st.session_state:
+    try:
+        st.session_state['vector_store'] = VectorStore()
+    except Exception as e:
+        st.error(f"VectorStore init failed: {e}")
+        st.stop()
+
+if 'orchestrator' not in st.session_state:
+    try:
+        st.session_state['orchestrator'] = OrchestratorAgent()
+    except Exception as e:
+        st.error(f"Orchestrator init failed: {e}")
+        st.stop()
+
 st.session_state.setdefault('memory', SessionMemory())
 st.session_state.setdefault('collection_name', None)
 st.session_state.setdefault('doc_meta', {})
 st.session_state.setdefault('run_count', 0)
 st.session_state.setdefault('token_count', 0)
 st.session_state.setdefault('session_id', str(uuid.uuid4())[:8].upper())
-st.session_state.setdefault('selected_model', 'llama3.2')
+if 'selected_model' not in st.session_state:
+    st.session_state['selected_model'] = DEFAULT_MODEL
 st.session_state.setdefault('agent_states', {
     'reader': 'idle',
     'summariser': 'idle',
@@ -47,20 +65,26 @@ st.session_state.setdefault('outputs', {
 st.session_state.setdefault('last_query', '')
 st.session_state.setdefault('is_running', False)
 
-if not check_ollama_running():
-    st.error("Alert: Ollama is not running. Open a terminal and run:  ollama serve")
-    st.stop()
-
-st.markdown("""
+st.markdown(
+    """
 <style>
 * { margin: 0; padding: 0; box-sizing: border-box; }
 body, .stApp { background: #07071a !important; color: #e0e0ff; font-family: 'Monaco', monospace; }
+
+.block-container {
+    padding: 0 !important;
+    max-width: 100% !important;
+}
+
+[data-testid="stFileUploader"] {
+    margin: 0 28px 12px;
+}
 
 .np-topbar {
     display: flex;
     justify-content: space-between;
     align-items: center;
-    padding: 14px 24px;
+    padding: 14px 28px;
     border-bottom: 1px solid rgba(139, 92, 246, 0.15);
     margin-bottom: 20px;
     background: rgba(15, 15, 40, 0.8);
@@ -73,8 +97,19 @@ body, .stApp { background: #07071a !important; color: #e0e0ff; font-family: 'Mon
 }
 
 .np-logo-mark { font-size: 20px; }
-.np-logo-name { font-size: 16px; font-weight: bold; color: #a78bfa; }
-.np-logo-sub { font-size: 10px; color: #3a3a6a; margin-left: 4px; }
+
+.np-logo-name {
+    font-size: 20px;
+    font-weight: 600;
+    color: #f0eeff;
+    letter-spacing: -0.3px;
+}
+
+.np-logo-sub {
+    font-size: 12px;
+    color: #8888b0;
+    margin-top: 2px;
+}
 
 .np-pills {
     display: flex;
@@ -84,13 +119,13 @@ body, .stApp { background: #07071a !important; color: #e0e0ff; font-family: 'Mon
 .np-pill {
     display: flex;
     align-items: center;
-    gap: 6px;
-    padding: 6px 12px;
-    background: rgba(139, 92, 246, 0.08);
-    border: 1px solid rgba(139, 92, 246, 0.2);
-    border-radius: 20px;
-    font-size: 11px;
-    color: #a78bfa;
+    gap: 7px;
+    background: rgba(255,255,255,0.04);
+    border: 1px solid rgba(255,255,255,0.09);
+    border-radius: 999px;
+    padding: 6px 16px;
+    font-size: 12px;
+    color: #a0a0c0;
 }
 
 .pd-green {
@@ -101,77 +136,96 @@ body, .stApp { background: #07071a !important; color: #e0e0ff; font-family: 'Mon
     box-shadow: 0 0 8px rgba(52, 211, 153, 0.5);
 }
 
-.hud-wrap {
-    position: relative;
-    width: 100%;
-    margin-bottom: 24px;
-}
-
-canvas {
-    display: block;
-    width: 100%;
-    height: 220px;
-    background: #07071a;
-    border-radius: 8px;
-    border: 1px solid rgba(139, 92, 246, 0.1);
-}
-
-.nc-hud {
-    position: absolute;
-    font-size: 10px;
-    color: #a78bfa;
-    font-weight: bold;
-    text-shadow: 0 0 12px rgba(139, 92, 246, 0.3);
-}
-
-.nc-hud-label { font-size: 8px; color: #6a6a9a; text-transform: uppercase; }
-.nc-hud-value { font-size: 12px; color: #34d399; margin: 2px 0; }
-
-.nc-hud-tl { top: 12px; left: 12px; }
-.nc-hud-tr { top: 12px; right: 12px; text-align: right; }
-.nc-hud-br { bottom: 12px; right: 12px; text-align: right; }
-
 .np-stats {
     display: grid;
     grid-template-columns: repeat(4, 1fr);
-    gap: 16px;
-    margin: 24px 0;
+    gap: 12px;
+    margin: 0 28px 20px;
 }
 
-.np-stat-card {
-    padding: 16px;
-    background: rgba(139, 92, 246, 0.05);
-    border: 1px solid rgba(139, 92, 246, 0.15);
-    border-radius: 8px;
+.np-stat {
+    background: rgba(255,255,255,0.03);
+    border: 1px solid rgba(139,92,246,0.18);
+    border-radius: 14px;
+    padding: 16px 18px;
     text-align: center;
+    transition: border-color 0.3s, background 0.3s;
 }
 
-.np-stat-label { font-size: 9px; color: #3a3a6a; text-transform: uppercase; letter-spacing: 1px; }
-.np-stat-value { font-size: 24px; font-weight: bold; color: #a78bfa; margin: 8px 0; }
-.np-stat-sub { font-size: 10px; color: #3a3a6a; }
+.np-stat:hover {
+    border-color: rgba(139,92,246,0.4);
+    background: rgba(139,92,246,0.05);
+}
+
+.np-stat-label {
+    font-size: 11px;
+    color: #7070a0;
+    letter-spacing: 1.5px;
+    margin-bottom: 6px;
+    font-family: monospace;
+    text-transform: uppercase;
+}
+
+.np-stat-val {
+    font-size: 22px;
+    font-weight: 700;
+    color: #e8e6ff;
+    margin: 8px 0;
+    font-family: monospace;
+}
+
+.np-stat-sub {
+    font-size: 11px;
+    color: #5a5a80;
+    margin-top: 3px;
+}
 
 .sec-label {
-    font-size: 9px;
+    font-size: 10px;
+    letter-spacing: 2.5px;
+    color: rgba(167,139,250,0.55);
+    font-family: monospace;
+    margin-bottom: 12px;
+    padding: 0 28px;
     text-transform: uppercase;
-    color: #3a3a6a;
-    letter-spacing: 2px;
-    margin: 20px 0 12px 0;
+    margin-top: 20px;
+}
+
+.np-dropzone {
+    margin: 0 28px 18px;
+    border: 1px dashed rgba(139,92,246,0.35);
+    border-radius: 14px;
+    padding: 36px;
+    text-align: center;
+    color: #7070a0;
+    font-size: 14px;
+    background: rgba(139,92,246,0.03);
 }
 
 .np-upload {
-    padding: 16px;
-    background: rgba(139, 92, 246, 0.08);
-    border: 1px solid rgba(139, 92, 246, 0.2);
-    border-radius: 8px;
+    margin: 0 28px 18px;
+    padding: 16px 20px;
+    background: rgba(139,92,246,0.06);
+    border: 1px solid rgba(139,92,246,0.25);
+    border-radius: 14px;
     display: flex;
     align-items: center;
     gap: 16px;
 }
 
 .np-upload-icon { font-size: 24px; }
-.np-upload-meta { flex: 1; }
-.np-upload-name { font-weight: bold; color: #a78bfa; font-size: 13px; }
-.np-upload-info { font-size: 10px; color: #3a3a6a; margin-top: 4px; }
+.np-upload-col { flex: 1; text-align: left; }
+.np-upload-name {
+    font-size: 14px;
+    font-weight: 600;
+    color: #e0deff;
+}
+
+.np-upload-meta {
+    font-size: 11px;
+    color: #6060a0;
+    margin-top: 4px;
+}
 
 .np-prog {
     width: 100%;
@@ -189,65 +243,61 @@ canvas {
     border-radius: 2px;
 }
 
-.drop-zone {
-    border: 1px dashed rgba(139, 92, 246, 0.2);
-    border-radius: 12px;
-    padding: 28px;
-    text-align: center;
-    color: #3a3a6a;
-    font-size: 12px;
-}
-
 .np-agents {
     display: grid;
     grid-template-columns: repeat(5, 1fr);
     gap: 12px;
-    margin: 20px 0;
+    margin: 0 28px 20px;
 }
 
 .np-agent {
-    padding: 12px;
-    border-radius: 8px;
-    border: 1px solid rgba(139, 92, 246, 0.2);
+    border-radius: 14px;
+    padding: 20px 10px 16px;
     text-align: center;
-    transition: all 0.3s ease;
-}
-
-.np-agent.idle {
-    opacity: 0.35;
-    background: rgba(30, 30, 60, 0.3);
-}
-
-.np-agent.active {
-    background: rgba(139, 92, 246, 0.1);
-    border-color: rgba(139, 92, 246, 0.5);
-    animation: card-pulse 1.5s ease-in-out infinite;
+    background: rgba(255,255,255,0.03);
+    border: 1px solid rgba(167,139,250,0.15);
+    position: relative;
+    overflow: hidden;
+    transition: all 0.4s ease;
 }
 
 .np-agent.done {
-    background: rgba(52, 211, 153, 0.1);
-    border-color: rgba(52, 211, 153, 0.5);
+    border-color: rgba(52,211,153,0.5);
+    background: rgba(52,211,153,0.05);
+    box-shadow: 0 0 20px rgba(52,211,153,0.07);
+}
+
+.np-agent.active {
+    border-color: rgba(139,92,246,0.65);
+    background: rgba(139,92,246,0.08);
+    box-shadow: 0 0 24px rgba(139,92,246,0.12);
+    animation: card-pulse 2s infinite;
+}
+
+.np-agent.idle {
+    opacity: 0.45;
 }
 
 @keyframes card-pulse {
-    0%, 100% { box-shadow: 0 0 0 0 rgba(139, 92, 246, 0.3); }
-    50% { box-shadow: 0 0 12px 4px rgba(139, 92, 246, 0.1); }
+    0%, 100% { box-shadow: 0 0 0 0 rgba(139, 92, 246, 0.25); }
+    50% { box-shadow: 0 0 18px 6px rgba(139, 92, 246, 0.12); }
 }
 
 .np-av {
-    position: relative;
-    width: 32px;
-    height: 32px;
-    margin: 0 auto 8px;
+    width: 44px;
+    height: 44px;
+    border-radius: 50%;
+    margin: 0 auto 10px;
     display: flex;
     align-items: center;
     justify-content: center;
-    font-size: 16px;
+    font-size: 22px;
+    position: relative;
 }
 
-.np-av.active {
-    animation: pulse 1s ease-in-out infinite;
-}
+.np-av.done   { background: rgba(52,211,153,0.18); }
+.np-av.active { background: rgba(139,92,246,0.22); animation: pulse 1s ease-in-out infinite; }
+.np-av.idle   { background: rgba(255,255,255,0.04); }
 
 @keyframes pulse {
     0%, 100% { transform: scale(1); }
@@ -256,8 +306,8 @@ canvas {
 
 .np-av-ring {
     position: absolute;
-    width: 40px;
-    height: 40px;
+    width: 52px;
+    height: 52px;
     border: 2px solid rgba(139, 92, 246, 0.5);
     border-radius: 50%;
     animation: rspin 2s linear infinite;
@@ -265,8 +315,8 @@ canvas {
 
 .np-av-ring2 {
     position: absolute;
-    width: 48px;
-    height: 48px;
+    width: 60px;
+    height: 60px;
     border: 1px dashed rgba(139, 92, 246, 0.3);
     border-radius: 50%;
     animation: rspin 3s linear infinite reverse;
@@ -278,17 +328,22 @@ canvas {
 }
 
 .np-aname {
-    font-size: 11px;
-    color: #a78bfa;
-    font-weight: bold;
-    margin-bottom: 6px;
+    font-size: 14px;
+    font-weight: 600;
+    color: #e0deff;
+    margin-top: 4px;
+    letter-spacing: 0.2px;
 }
 
 .np-abadge {
-    display: inline-block;
-    font-size: 9px;
-    padding: 4px 8px;
-    border-radius: 12px;
+    display: inline-flex;
+    align-items: center;
+    gap: 5px;
+    margin-top: 6px;
+    font-size: 11px;
+    padding: 3px 10px;
+    border-radius: 999px;
+    font-weight: 500;
     text-transform: uppercase;
     letter-spacing: 0.5px;
 }
@@ -318,59 +373,77 @@ canvas {
     display: flex;
     flex-direction: column;
     gap: 12px;
-    margin: 20px 0;
+    margin: 0 28px 20px;
 }
 
 .np-ocard {
-    border-radius: 8px;
-    border: 1px solid rgba(139, 92, 246, 0.2);
+    background: rgba(255,255,255,0.025);
+    border: 1px solid rgba(167,139,250,0.12);
+    border-radius: 14px;
+    margin-bottom: 4px;
     overflow: hidden;
-    transition: all 0.3s ease;
+    transition: border-color 0.3s ease, background 0.3s ease, box-shadow 0.3s ease;
 }
 
 .np-ocard.idle {
-    opacity: 0.35;
-    background: rgba(30, 30, 60, 0.2);
+    opacity: 0.45;
 }
 
 .np-ocard.active {
-    background: rgba(139, 92, 246, 0.08);
-    border-color: rgba(139, 92, 246, 0.5);
+    border-color: rgba(139,92,246,0.5);
+    background: rgba(139,92,246,0.05);
+    box-shadow: 0 0 20px rgba(139,92,246,0.1);
 }
 
 .np-ocard.done {
-    background: rgba(52, 211, 153, 0.05);
-    border-color: rgba(52, 211, 153, 0.3);
+    border-color: rgba(52,211,153,0.3);
+    background: rgba(52,211,153,0.03);
 }
 
 .np-ohead {
-    padding: 12px;
     display: flex;
     align-items: center;
     gap: 12px;
-    border-bottom: 1px solid rgba(139, 92, 246, 0.1);
+    padding: 14px 18px;
 }
 
 .np-oicon {
-    font-size: 18px;
+    width: 32px;
+    height: 32px;
+    border-radius: 8px;
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    font-size: 16px;
+    flex-shrink: 0;
 }
 
 .np-otitle {
+    font-size: 14px;
+    font-weight: 600;
+    color: #e8e6ff;
     flex: 1;
-    font-size: 12px;
-    color: #a78bfa;
-    font-weight: bold;
 }
 
 .np-ostatus {
-    font-size: 10px;
-    padding: 4px 8px;
-    border-radius: 12px;
+    font-size: 11px;
+    padding: 3px 11px;
+    border-radius: 999px;
+    font-weight: 500;
+    margin-left: auto;
     text-transform: uppercase;
 }
 
+.os-done   { background: rgba(52,211,153,0.14);  color: #6ee7b7; }
+.os-active { background: rgba(139,92,246,0.16);  color: #c4b5fd; }
+.os-idle   { background: rgba(255,255,255,0.05); color: #4a4a70; }
+
 .np-obody {
-    padding: 12px;
+    padding: 8px 18px 16px;
+    border-top: 1px solid rgba(139,92,246,0.08);
+    font-size: 13px;
+    color: #a0a0c8;
+    line-height: 1.9;
 }
 
 .shimmer-line {
@@ -390,10 +463,14 @@ canvas {
     50% { opacity: 1; }
     100% { opacity: 0.5; }
 }
-</style>
-""", unsafe_allow_html=True)
 
-st.markdown(f"""
+</style>
+""",
+    unsafe_allow_html=True,
+)
+
+st.markdown(
+    f"""
 <div class="np-topbar">
     <div class="np-logo">
         <span class="np-logo-mark">Brain</span>
@@ -406,11 +483,13 @@ st.markdown(f"""
             Ollama · {DEFAULT_MODEL}
         </div>
         <div class="np-pill">
-            Package ChromaDB ready
+            📦 VectorStore ready
         </div>
     </div>
 </div>
-""", unsafe_allow_html=True)
+""",
+    unsafe_allow_html=True,
+)
 
 agent_states_json = json.dumps(st.session_state.agent_states)
 session_id = st.session_state.session_id
@@ -418,39 +497,53 @@ chunk_count = st.session_state.doc_meta.get('chunks', 0)
 token_count = st.session_state.token_count
 
 neural_canvas_html = f"""
-<div class="hud-wrap">
-    <canvas id="nc" width="100%" height="220"></canvas>
-    <div class="nc-hud nc-hud-tl">
-        <div class="nc-hud-label">NEURAL MESH</div>
-        <div class="nc-hud-value">{chunk_count}</div>
-        <div class="nc-hud-label">CHUNKS LOADED</div>
-    </div>
-    <div class="nc-hud nc-hud-tr">
-        <div class="nc-hud-label">TOKENS PROCESSED</div>
-        <div class="nc-hud-value" id="token-display">{token_count}</div>
-        <div class="nc-hud-label">VECTOR DIMS 4096</div>
-    </div>
-    <div class="nc-hud nc-hud-br">
-        <div class="nc-hud-label">SESSION ID</div>
-        <div class="nc-hud-value">{session_id}</div>
-    </div>
+<div style="width:100%; height:240px; background:#07071a; position:relative; overflow:hidden;">
+<style>
+    .nc-hud {{ position: absolute; z-index: 2; pointer-events: none; font-family: ui-monospace, monospace; }}
+    .nc-hud-tl {{ top: 12px; left: 12px; }}
+    .nc-hud-tr {{ top: 12px; right: 12px; text-align: right; }}
+    .nc-hud-br {{ bottom: 12px; right: 12px; text-align: right; }}
+</style>
+<canvas id="nc" style="position:absolute; top:0; left:0; width:100%; height:100%; display:block; z-index:1;"></canvas>
+<div class="nc-hud nc-hud-tl">
+    <div style="font-size:10px; letter-spacing:3px; text-transform:uppercase; color:rgba(167,139,250,0.6);">NEURAL MESH</div>
+    <span style="font-size:32px; font-weight:700; color:#d4b8ff; line-height:1.15; display:block; margin:4px 0;">{chunk_count}</span>
+    <div style="font-size:10px; color:rgba(167,139,250,0.4); text-transform:uppercase; letter-spacing:1px;">CHUNKS LOADED</div>
+</div>
+<div class="nc-hud nc-hud-tr">
+    <div style="font-size:11px; color:rgba(167,139,250,0.55); text-transform:uppercase; letter-spacing:0.5px;">TOKENS PROCESSED</div>
+    <div><span id="token-display" style="font-size:13px; font-weight:700; color:#b8a0ff;">{token_count}</span></div>
+    <div style="font-size:11px; color:rgba(167,139,250,0.55); text-transform:uppercase; margin-top:6px; letter-spacing:0.5px;">VECTOR DIMS 4096</div>
+</div>
+<div class="nc-hud nc-hud-br">
+    <div style="font-size:11px; color:rgba(167,139,250,0.55); text-transform:uppercase;">SESSION ID</div>
+    <div><span style="font-size:12px; font-weight:700; color:#b8a0ff;">{session_id}</span></div>
+</div>
 </div>
 
 <script>
-    const canvas = document.getElementById('nc');
-    const ctx = canvas.getContext('2d');
-
-    canvas.width = canvas.offsetWidth;
-    canvas.height = 220;
-
+    const cv = document.getElementById('nc');
+    const ctx = cv.getContext('2d');
     let particles = [];
     let agentStates = {agent_states_json};
     let tokenCount = {token_count};
 
+    function resize() {{
+        const W = cv.parentElement.offsetWidth || window.innerWidth || 900;
+        const H = 240;
+        cv.width = W;
+        cv.height = H;
+    }}
+    resize();
+    window.addEventListener('resize', function() {{
+        resize();
+        seedParticles();
+    }});
+
     class Particle {{
         constructor() {{
-            this.x = Math.random() * canvas.width;
-            this.y = Math.random() * canvas.height;
+            this.x = Math.random() * cv.width;
+            this.y = Math.random() * cv.height;
             this.vx = (Math.random() - 0.5) * 2;
             this.vy = (Math.random() - 0.5) * 2;
             this.radius = 1.2;
@@ -459,10 +552,10 @@ neural_canvas_html = f"""
         update() {{
             this.x += this.vx;
             this.y += this.vy;
-            if (this.x <= 0 || this.x >= canvas.width) this.vx *= -1;
-            if (this.y <= 0 || this.y >= canvas.height) this.vy *= -1;
-            this.x = Math.max(0, Math.min(canvas.width, this.x));
-            this.y = Math.max(0, Math.min(canvas.height, this.y));
+            if (this.x <= 0 || this.x >= cv.width) this.vx *= -1;
+            if (this.y <= 0 || this.y >= cv.height) this.vy *= -1;
+            this.x = Math.max(0, Math.min(cv.width, this.x));
+            this.y = Math.max(0, Math.min(cv.height, this.y));
         }}
 
         draw() {{
@@ -473,9 +566,13 @@ neural_canvas_html = f"""
         }}
     }}
 
-    for (let i = 0; i < 75; i++) {{
-        particles.push(new Particle());
+    function seedParticles() {{
+        particles = [];
+        for (let i = 0; i < 75; i++) {{
+            particles.push(new Particle());
+        }}
     }}
+    seedParticles();
 
     function drawAgentNode(x, y, label, state) {{
         const radius = 14;
@@ -517,7 +614,7 @@ neural_canvas_html = f"""
 
     function animate() {{
         ctx.fillStyle = '#07071a';
-        ctx.fillRect(0, 0, canvas.width, canvas.height);
+        ctx.fillRect(0, 0, cv.width, cv.height);
 
         for (let p of particles) {{
             p.update();
@@ -546,15 +643,15 @@ neural_canvas_html = f"""
         }}
 
         const nodePositions = [
-            {{ x: canvas.width * 0.15, label: 'R' }},
-            {{ x: canvas.width * 0.28, label: 'S' }},
-            {{ x: canvas.width * 0.50, label: 'A' }},
-            {{ x: canvas.width * 0.72, label: 'Q' }},
-            {{ x: canvas.width * 0.85, label: 'W' }}
+            {{ x: cv.width * 0.15, label: 'R' }},
+            {{ x: cv.width * 0.28, label: 'S' }},
+            {{ x: cv.width * 0.50, label: 'A' }},
+            {{ x: cv.width * 0.72, label: 'Q' }},
+            {{ x: cv.width * 0.85, label: 'W' }}
         ];
 
         const nodeLabels = ['reader', 'summariser', 'analyser', 'qa', 'writer'];
-        const y = canvas.height * 0.45;
+        const y = cv.height * 0.45;
 
         for (let i = 0; i < nodePositions.length; i++) {{
             const state = agentStates[nodeLabels[i]] || 'idle';
@@ -579,37 +676,41 @@ neural_canvas_html = f"""
 
     setInterval(function() {{
         tokenCount += Math.floor(Math.random() * 14) + 4;
-        document.getElementById('token-display').textContent = tokenCount;
+        const el = document.getElementById('token-display');
+        if (el) el.textContent = tokenCount;
     }}, 700);
 </script>
 """
 
-components.html(neural_canvas_html, height=280)
+components.html(neural_canvas_html, height=240, scrolling=False)
 
-st.markdown(f"""
+st.markdown(
+    f"""
 <div class="np-stats">
-    <div class="np-stat-card">
+    <div class="np-stat">
         <div class="np-stat-label">DOCUMENT</div>
-        <div class="np-stat-value">{st.session_state.doc_meta.get('name', 'N/A')}</div>
+        <div class="np-stat-val">{st.session_state.doc_meta.get('name', 'N/A')}</div>
         <div class="np-stat-sub">{st.session_state.doc_meta.get('chunks', 0)} chunks</div>
     </div>
-    <div class="np-stat-card">
+    <div class="np-stat">
         <div class="np-stat-label">ACTIVE AGENTS</div>
-        <div class="np-stat-value">{sum(1 for v in st.session_state.agent_states.values() if v in ['active', 'done'])}</div>
+        <div class="np-stat-val">{sum(1 for v in st.session_state.agent_states.values() if v in ['active', 'done'])}</div>
         <div class="np-stat-sub">of 5 total</div>
     </div>
-    <div class="np-stat-card">
+    <div class="np-stat">
         <div class="np-stat-label">SESSION RUNS</div>
-        <div class="np-stat-value">{st.session_state.run_count}</div>
+        <div class="np-stat-val">{st.session_state.run_count}</div>
         <div class="np-stat-sub">this session</div>
     </div>
-    <div class="np-stat-card">
+    <div class="np-stat">
         <div class="np-stat-label">MODEL</div>
-        <div class="np-stat-value">{DEFAULT_MODEL}</div>
+        <div class="np-stat-val">{DEFAULT_MODEL}</div>
         <div class="np-stat-sub">local free</div>
     </div>
 </div>
-""", unsafe_allow_html=True)
+""",
+    unsafe_allow_html=True,
+)
 
 st.markdown('<div class="sec-label">DOCUMENT_LOAD INPUT</div>', unsafe_allow_html=True)
 
@@ -634,28 +735,34 @@ if uploaded_file is not None:
     st.session_state.agent_states = {k: 'idle' for k in st.session_state.agent_states}
     st.session_state.outputs = {k: None for k in st.session_state.outputs}
 
-    st.markdown(f"""
-    <div class="np-upload">
-        <div class="np-upload-icon">Document</div>
-        <div class="np-upload-meta">
-            <div class="np-upload-name">{uploaded_file.name}</div>
-            <div class="np-upload-info">{len(chunks)} chunks {round(uploaded_file.size/1024, 1)} KB</div>
-            <div class="np-prog"><div class="np-prog-fill"></div></div>
+    st.markdown(
+        dedent(f"""
+        <div class="np-upload">
+            <div class="np-upload-icon">📄</div>
+            <div class="np-upload-col">
+                <div class="np-upload-name">{uploaded_file.name}</div>
+                <div class="np-upload-meta">{len(chunks)} chunks · {round(uploaded_file.size/1024, 1)} KB</div>
+                <div class="np-prog"><div class="np-prog-fill"></div></div>
+            </div>
         </div>
-    </div>
-    """, unsafe_allow_html=True)
+        """).strip(),
+        unsafe_allow_html=True,
+    )
 
-    st.success(f"Success: {len(chunks)} chunks ingested into ChromaDB")
+    st.success(f"Success: {len(chunks)} chunks ingested into VectorStore")
 else:
-    st.markdown("""
-    <div class="drop-zone">
-        Brain Drop a document to begin PDF DOCX TXT
-    </div>
-    """, unsafe_allow_html=True)
+    st.markdown(
+        dedent("""
+        <div class="np-dropzone">
+            Drop a document to begin — PDF, DOCX, or TXT
+        </div>
+        """).strip(),
+        unsafe_allow_html=True,
+    )
 
 st.markdown('<div class="sec-label">AGENT_STATUS LIVE</div>', unsafe_allow_html=True)
 
-agent_cards_html = "<div class='np-agents'>"
+agent_cards_html = "<div class=\"np-agents\">"
 for key in ['reader', 'summariser', 'analyser', 'qa', 'writer']:
     state = st.session_state.agent_states[key]
     icon = AGENT_CONFIG[key]['icon']
@@ -673,37 +780,53 @@ for key in ['reader', 'summariser', 'analyser', 'qa', 'writer']:
     else:
         badge_text = "waiting"
 
-    agent_cards_html += f"""
-    <div class="np-agent {state}">
-        <div class="np-av {state}">
-            {rings_html}
-            <span>{icon}</span>
+    agent_cards_html += dedent(
+        f"""
+        <div class="np-agent {state}">
+            <div class="np-av {state}">
+                {rings_html}
+                <span>{icon}</span>
+            </div>
+            <div class="np-aname">{label}</div>
+            <div class="np-abadge nb-{state}">{badge_text}</div>
         </div>
-        <div class="np-aname">{label}</div>
-        <div class="np-abadge nb-{state}">{badge_text}</div>
-    </div>
-    """
+        """
+    ).strip()
 
 agent_cards_html += "</div>"
 st.markdown(agent_cards_html, unsafe_allow_html=True)
 
 st.markdown('<div class="sec-label">QUERY_INPUT PROMPT</div>', unsafe_allow_html=True)
 
-col1, col2 = st.columns([5, 1])
-query = col1.text_input("",
-                        placeholder="Ask something about your document...",
-                        label_visibility="collapsed",
-                        disabled=(st.session_state.collection_name is None),
-                        key="query_input")
-run_btn = col2.button("Run Agents",
-                      disabled=(st.session_state.collection_name is None),
-                      use_container_width=True)
-
-st.caption("model")
-st.selectbox("",
-             options=["llama3.2","deepseek-r1","qwen2.5:7b","llama3.2:1b"],
-             label_visibility="collapsed",
-             key="selected_model")
+_mg_l, q_main, _mg_r = st.columns([0.055, 0.89, 0.055])
+with q_main:
+    _model_opts = ["llama3.2", "deepseek-r1", "qwen2.5:7b", "llama3.2:1b"]
+    _model_idx = (
+        _model_opts.index(st.session_state.selected_model)
+        if st.session_state.selected_model in _model_opts
+        else 0
+    )
+    col1, col2 = st.columns([5, 1])
+    query = col1.text_input(
+        "",
+        placeholder="Ask something about your document...",
+        label_visibility="collapsed",
+        disabled=(st.session_state.collection_name is None),
+        key="query_input",
+    )
+    run_btn = col2.button(
+        "Run Agents",
+        disabled=(st.session_state.collection_name is None),
+        use_container_width=True,
+    )
+    st.caption("Model")
+    st.selectbox(
+        "Model",
+        _model_opts,
+        index=_model_idx,
+        label_visibility="collapsed",
+        key="selected_model",
+    )
 
 if run_btn and query and st.session_state.collection_name and not st.session_state.is_running:
     st.session_state.is_running = True
@@ -801,37 +924,44 @@ for key in ['reader', 'summariser', 'analyser', 'qa', 'writer']:
     label = AGENT_CONFIG[key]['label']
     desc = descriptions.get(key, '')
 
-    status_badge = state.capitalize()
     if state == 'active':
-        status_badge = "in progress"
+        status_badge = "IN PROGRESS"
     elif state == 'done':
-        status_badge = "complete"
+        status_badge = "COMPLETE"
     else:
-        status_badge = "waiting"
+        status_badge = "WAITING"
 
-    st.markdown(f"""
-    <div class="np-ocard {state}">
-        <div class="np-ohead">
-            <div class="np-oicon">{icon}</div>
-            <span class="np-otitle">{label} — {desc}</span>
-            <span class="np-ostatus">{status_badge}</span>
-        </div>
-    """, unsafe_allow_html=True)
+    st.markdown(
+        dedent(
+            f"""
+            <div class="np-ocard {state}">
+                <div class="np-ohead">
+                    <div class="np-oicon">{icon}</div>
+                    <span class="np-otitle">{label} — {desc}</span>
+                    <span class="np-ostatus os-{state}">{status_badge}</span>
+                </div>
+            """
+        ).strip(),
+        unsafe_allow_html=True,
+    )
 
     if state == 'active':
-        st.markdown("""
-        <div class="np-obody">
-            <div class="shimmer-line f"></div>
-            <div class="shimmer-line m"></div>
-            <div class="shimmer-line f"></div>
-            <div class="shimmer-line s"></div>
-            <div class="shimmer-line m"></div>
-        </div>
-        """, unsafe_allow_html=True)
+        st.markdown(
+            dedent("""
+            <div class="np-obody">
+                <div class="shimmer-line f"></div>
+                <div class="shimmer-line m"></div>
+                <div class="shimmer-line f"></div>
+                <div class="shimmer-line s"></div>
+                <div class="shimmer-line m"></div>
+            </div>
+            """).strip(),
+            unsafe_allow_html=True,
+        )
     elif state == 'done' and output:
         st.markdown("<div class='np-obody'>", unsafe_allow_html=True)
         with st.expander(f"{icon} {label}", expanded=True):
-            st.markdown(output)
+            st.markdown(output, unsafe_allow_html=False)
         st.markdown("</div>", unsafe_allow_html=True)
     else:
         st.markdown("<div class='np-obody'></div>", unsafe_allow_html=True)

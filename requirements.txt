@@ -11,5 +11,5 @@ tiktoken
 fastapi
 uvicorn
 requests
-faiss-cpu
+chromadb==0.4.24
 sentence-transformers

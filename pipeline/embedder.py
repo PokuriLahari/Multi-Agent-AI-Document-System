@@ -1,71 +1,79 @@
-import faiss
-import numpy as np
-import json
 import os
-from sentence_transformers import SentenceTransformer
-
+import json
+import math
+import uuid
 
 class VectorStore:
-    def __init__(self, persist_dir: str = "./.faiss_store"):
+    def __init__(self, persist_dir="./.vector_store"):
         self.persist_dir = persist_dir
+        self.store = {}
         os.makedirs(persist_dir, exist_ok=True)
-        self.model = SentenceTransformer("all-MiniLM-L6-v2")
-        self.indexes = {}
-        self.chunks = {}
+
+    def _embed(self, text: str) -> dict:
+        words = text.lower().split()
+        freq = {}
+        for w in words:
+            freq[w] = freq.get(w, 0) + 1
+        total = max(len(words), 1)
+        return {w: c / total for w, c in freq.items()}
+
+    def _similarity(self, a: dict, b: dict) -> float:
+        keys = set(a) & set(b)
+        if not keys:
+            return 0.0
+        dot = sum(a[k] * b[k] for k in keys)
+        mag_a = math.sqrt(sum(v*v for v in a.values()))
+        mag_b = math.sqrt(sum(v*v for v in b.values()))
+        if mag_a == 0 or mag_b == 0:
+            return 0.0
+        return dot / (mag_a * mag_b)
 
     def ingest(self, chunks: list, collection_name: str) -> int:
-        texts = [c["text"] for c in chunks]
-        embeddings = self.model.encode(texts, show_progress_bar=False)
-        embeddings = embeddings.astype("float32")
+        docs = []
+        for c in chunks:
+            docs.append({
+                "id":          str(uuid.uuid4()),
+                "text":        c["text"],
+                "embedding":   self._embed(c["text"]),
+                "source_file": c.get("source_file", ""),
+                "page_number": c.get("page_number", 0),
+            })
+        self.store[collection_name] = docs
+        path = os.path.join(self.persist_dir, f"{collection_name}.json")
+        with open(path, "w", encoding="utf-8") as f:
+            json.dump(docs, f, ensure_ascii=False)
+        return len(docs)
 
-        embedding_dim = embeddings.shape[1]
-        index = faiss.IndexFlatL2(embedding_dim)
-        index.add(embeddings)
-
-        self.indexes[collection_name] = index
-        self.chunks[collection_name] = chunks
-
-        index_path = os.path.join(self.persist_dir, f"{collection_name}.index")
-        chunks_path = os.path.join(self.persist_dir, f"{collection_name}.json")
-
-        faiss.write_index(index, index_path)
-        with open(chunks_path, "w") as f:
-            json.dump(chunks, f)
-
-        return len(chunks)
-
-    def search(self, query: str, collection_name: str, n_results: int = 5) -> list:
-        if collection_name not in self.indexes:
+    def search(self, query: str, collection_name: str,
+               n_results: int = 5) -> list:
+        if collection_name not in self.store:
             self._load(collection_name)
-
-        if collection_name not in self.indexes:
+        docs = self.store.get(collection_name, [])
+        if not docs:
             return []
-
-        q_emb = self.model.encode([query])
-        q_emb = q_emb.astype("float32")
-
-        D, I = self.indexes[collection_name].search(q_emb, n_results)
-
-        chunks = self.chunks[collection_name]
-        return [chunks[i] for i in I[0] if i < len(chunks)]
+        q_emb = self._embed(query)
+        scored = sorted(
+            docs,
+            key=lambda d: self._similarity(q_emb, d["embedding"]),
+            reverse=True
+        )
+        return [
+            {
+                "text":        d["text"],
+                "source_file": d["source_file"],
+                "page_number": d["page_number"]
+            }
+            for d in scored[:n_results]
+        ]
 
     def _load(self, collection_name: str):
-        index_path = os.path.join(self.persist_dir, f"{collection_name}.index")
-        chunks_path = os.path.join(self.persist_dir, f"{collection_name}.json")
-
-        if os.path.exists(index_path) and os.path.exists(chunks_path):
-            self.indexes[collection_name] = faiss.read_index(index_path)
-            with open(chunks_path, "r") as f:
-                self.chunks[collection_name] = json.load(f)
+        path = os.path.join(self.persist_dir, f"{collection_name}.json")
+        if os.path.exists(path):
+            with open(path, encoding="utf-8") as f:
+                self.store[collection_name] = json.load(f)
 
     def clear(self, collection_name: str):
-        self.indexes.pop(collection_name, None)
-        self.chunks.pop(collection_name, None)
-
-        index_path = os.path.join(self.persist_dir, f"{collection_name}.index")
-        chunks_path = os.path.join(self.persist_dir, f"{collection_name}.json")
-
-        if os.path.exists(index_path):
-            os.remove(index_path)
-        if os.path.exists(chunks_path):
-            os.remove(chunks_path)
+        self.store.pop(collection_name, None)
+        path = os.path.join(self.persist_dir, f"{collection_name}.json")
+        if os.path.exists(path):
+            os.remove(path)

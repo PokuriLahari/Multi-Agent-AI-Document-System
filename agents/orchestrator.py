@@ -21,7 +21,7 @@ class OrchestratorAgent(BaseAgent):
         temp_orchestrator = BaseAgent(
             name="IntentDetector",
             system_prompt=intent_system_prompt,
-            model=self.model
+            model=self.model_name
         )
         response = temp_orchestrator.run(user_message)
         intent = response.strip().upper()
