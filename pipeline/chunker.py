@@ -39,6 +39,21 @@ def chunk_document(file_path: str) -> list[dict]:
                 }
             )
 
+    if not chunks:
+        # Return a single informational chunk so agents
+        # always have something to work with
+        chunks = [{
+            "chunk_id": str(uuid.uuid4()),
+            "text": (
+                f"Document '{filename}' was uploaded but "
+                "no text content could be extracted. "
+                "This may be a scanned image PDF or an "
+                "unsupported format."
+            ),
+            "source_file": filename,
+            "page_number": 0,
+            "char_count": 0,
+        }]
     return chunks
 
 

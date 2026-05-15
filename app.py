@@ -2,7 +2,6 @@ import streamlit as st
 import streamlit.components.v1 as components
 import os, uuid, json
 from pathlib import Path
-from textwrap import dedent
 from pipeline.chunker import chunk_document
 from pipeline.embedder import VectorStore
 from agents.orchestrator import OrchestratorAgent
@@ -64,6 +63,7 @@ st.session_state.setdefault('outputs', {
 })
 st.session_state.setdefault('last_query', '')
 st.session_state.setdefault('is_running', False)
+st.session_state.setdefault('selected_agents', [])
 
 st.markdown(
     """
@@ -470,24 +470,22 @@ body, .stApp { background: #07071a !important; color: #e0e0ff; font-family: 'Mon
 )
 
 st.markdown(
-    f"""
-<div class="np-topbar">
-    <div class="np-logo">
-        <span class="np-logo-mark">Brain</span>
-        <span class="np-logo-name">Doc Dream Team</span>
-        <span class="np-logo-sub">multi-agent document intelligence</span>
-    </div>
-    <div class="np-pills">
-        <div class="np-pill">
-            <span class="pd-green"></span>
-            Ollama · {DEFAULT_MODEL}
-        </div>
-        <div class="np-pill">
-            📦 VectorStore ready
-        </div>
-    </div>
-</div>
-""",
+    '<div class="np-topbar">'
+    + '<div class="np-logo">'
+    + '<span class="np-logo-mark">Brain</span>'
+    + '<span class="np-logo-name">Doc Dream Team</span>'
+    + '<span class="np-logo-sub">multi-agent document intelligence</span>'
+    + '</div>'
+    + '<div class="np-pills">'
+    + '<div class="np-pill">'
+    + '<span class="pd-green"></span>'
+    + 'Ollama · ' + DEFAULT_MODEL
+    + '</div>'
+    + '<div class="np-pill">'
+    + '📦 VectorStore ready'
+    + '</div>'
+    + '</div>'
+    + '</div>',
     unsafe_allow_html=True,
 )
 
@@ -685,30 +683,28 @@ neural_canvas_html = f"""
 components.html(neural_canvas_html, height=240, scrolling=False)
 
 st.markdown(
-    f"""
-<div class="np-stats">
-    <div class="np-stat">
-        <div class="np-stat-label">DOCUMENT</div>
-        <div class="np-stat-val">{st.session_state.doc_meta.get('name', 'N/A')}</div>
-        <div class="np-stat-sub">{st.session_state.doc_meta.get('chunks', 0)} chunks</div>
-    </div>
-    <div class="np-stat">
-        <div class="np-stat-label">ACTIVE AGENTS</div>
-        <div class="np-stat-val">{sum(1 for v in st.session_state.agent_states.values() if v in ['active', 'done'])}</div>
-        <div class="np-stat-sub">of 5 total</div>
-    </div>
-    <div class="np-stat">
-        <div class="np-stat-label">SESSION RUNS</div>
-        <div class="np-stat-val">{st.session_state.run_count}</div>
-        <div class="np-stat-sub">this session</div>
-    </div>
-    <div class="np-stat">
-        <div class="np-stat-label">MODEL</div>
-        <div class="np-stat-val">{DEFAULT_MODEL}</div>
-        <div class="np-stat-sub">local free</div>
-    </div>
-</div>
-""",
+    '<div class="np-stats">'
+    + '<div class="np-stat">'
+    + '<div class="np-stat-label">DOCUMENT</div>'
+    + '<div class="np-stat-val">' + str(st.session_state.doc_meta.get('name', 'N/A')) + '</div>'
+    + '<div class="np-stat-sub">' + str(st.session_state.doc_meta.get('chunks', 0)) + ' chunks</div>'
+    + '</div>'
+    + '<div class="np-stat">'
+    + '<div class="np-stat-label">ACTIVE AGENTS</div>'
+    + '<div class="np-stat-val">' + str(sum(1 for v in st.session_state.agent_states.values() if v in ['active', 'done'])) + '</div>'
+    + '<div class="np-stat-sub">of 5 total</div>'
+    + '</div>'
+    + '<div class="np-stat">'
+    + '<div class="np-stat-label">SESSION RUNS</div>'
+    + '<div class="np-stat-val">' + str(st.session_state.run_count) + '</div>'
+    + '<div class="np-stat-sub">this session</div>'
+    + '</div>'
+    + '<div class="np-stat">'
+    + '<div class="np-stat-label">MODEL</div>'
+    + '<div class="np-stat-val">' + DEFAULT_MODEL + '</div>'
+    + '<div class="np-stat-sub">local free</div>'
+    + '</div>'
+    + '</div>',
     unsafe_allow_html=True,
 )
 
@@ -736,65 +732,58 @@ if uploaded_file is not None:
     st.session_state.outputs = {k: None for k in st.session_state.outputs}
 
     st.markdown(
-        dedent(f"""
-        <div class="np-upload">
-            <div class="np-upload-icon">📄</div>
-            <div class="np-upload-col">
-                <div class="np-upload-name">{uploaded_file.name}</div>
-                <div class="np-upload-meta">{len(chunks)} chunks · {round(uploaded_file.size/1024, 1)} KB</div>
-                <div class="np-prog"><div class="np-prog-fill"></div></div>
-            </div>
-        </div>
-        """).strip(),
+        '<div class="np-upload">'
+        + '<div class="np-upload-icon">📄</div>'
+        + '<div class="np-upload-col">'
+        + '<div class="np-upload-name">' + uploaded_file.name + '</div>'
+        + '<div class="np-upload-meta">' + str(len(chunks)) + ' chunks · ' + str(round(uploaded_file.size/1024, 1)) + ' KB</div>'
+        + '<div class="np-prog"><div class="np-prog-fill"></div></div>'
+        + '</div>'
+        + '</div>',
         unsafe_allow_html=True,
     )
 
     st.success(f"Success: {len(chunks)} chunks ingested into VectorStore")
 else:
     st.markdown(
-        dedent("""
-        <div class="np-dropzone">
-            Drop a document to begin — PDF, DOCX, or TXT
-        </div>
-        """).strip(),
+        '<div class="np-dropzone">'
+        + 'Drop a document to begin — PDF, DOCX, or TXT'
+        + '</div>',
         unsafe_allow_html=True,
     )
 
 st.markdown('<div class="sec-label">AGENT_STATUS LIVE</div>', unsafe_allow_html=True)
 
-agent_cards_html = "<div class=\"np-agents\">"
-for key in ['reader', 'summariser', 'analyser', 'qa', 'writer']:
-    state = st.session_state.agent_states[key]
-    icon = AGENT_CONFIG[key]['icon']
-    label = AGENT_CONFIG[key]['label']
+def build_agent_cards():
+    cards = []
+    for key in ['reader', 'summariser', 'analyser', 'qa', 'writer']:
+        state = st.session_state.agent_states[key]
+        icon  = AGENT_CONFIG[key]['icon']
+        label = AGENT_CONFIG[key]['label']
 
-    rings_html = ""
-    if state == 'active':
-        rings_html = "<div class='np-av-ring'></div><div class='np-av-ring2'></div>"
+        if state == 'active':
+            badge = 'WORKING'
+            rings = '<div class="np-av-ring"></div><div class="np-av-ring2"></div>'
+        elif state == 'done':
+            badge = 'DONE'
+            rings = ''
+        else:
+            badge = 'WAITING'
+            rings = ''
 
-    badge_text = state.capitalize()
-    if state == 'active':
-        badge_text = "working"
-    elif state == 'done':
-        badge_text = "done"
-    else:
-        badge_text = "waiting"
+        cards.append(
+            '<div class="np-agent ' + state + '">'
+            + '<div class="np-av ' + state + '">'
+            + rings
+            + '<span>' + icon + '</span>'
+            + '</div>'
+            + '<div class="np-aname">' + label + '</div>'
+            + '<div class="np-abadge nb-' + state + '">' + badge + '</div>'
+            + '</div>'
+        )
+    return '<div class="np-agents">' + ''.join(cards) + '</div>'
 
-    agent_cards_html += dedent(
-        f"""
-        <div class="np-agent {state}">
-            <div class="np-av {state}">
-                {rings_html}
-                <span>{icon}</span>
-            </div>
-            <div class="np-aname">{label}</div>
-            <div class="np-abadge nb-{state}">{badge_text}</div>
-        </div>
-        """
-    ).strip()
-
-agent_cards_html += "</div>"
-st.markdown(agent_cards_html, unsafe_allow_html=True)
+st.markdown(build_agent_cards(), unsafe_allow_html=True)
 
 st.markdown('<div class="sec-label">QUERY_INPUT PROMPT</div>', unsafe_allow_html=True)
 
@@ -828,147 +817,214 @@ with q_main:
         key="selected_model",
     )
 
-if run_btn and query and st.session_state.collection_name and not st.session_state.is_running:
-    st.session_state.is_running = True
+    if st.session_state.collection_name:
+        if st.button(
+            "⚡ Run All Agents (force)",
+            use_container_width=False
+        ):
+            # Force MULTI intent — runs reader+summariser+analyser+qa
+            st.session_state.last_query = (
+                query if query else
+                "Summarise and analyse this document fully."
+            )
+            st.session_state.run_count += 1
+            st.session_state.is_running = True
+            st.session_state.outputs = {
+                k: None for k in st.session_state.outputs
+            }
+            for k in st.session_state.agent_states:
+                st.session_state.agent_states[k] = (
+                    'active'
+                    if k in ['reader','summariser','analyser','qa']
+                    else 'idle'
+                )
+            st.rerun()
 
+INTENT_MAP = {
+    "SUMMARISE": ['reader', 'summariser'],
+    "ANALYSE":   ['reader', 'analyser'],
+    "QA":        ['reader', 'qa'],
+    "WRITE":     ['reader', 'summariser', 'writer'],
+    "MULTI":     ['reader', 'summariser', 'analyser', 'qa'],
+    "READ":      ['reader', 'summariser'],
+}
+
+DEFAULT_AGENTS = ['reader', 'summariser', 'analyser', 'qa']
+
+if run_btn and query and st.session_state.collection_name:
+
+    # reset state
     st.session_state.last_query = query
     st.session_state.run_count += 1
     st.session_state.outputs = {k: None for k in st.session_state.outputs}
+    st.session_state.is_running = True
 
+    # detect intent
     try:
         intent = st.session_state.orchestrator.detect_intent(query)
+        if not intent or intent.strip() == "":
+            intent = "MULTI"
+        intent = intent.strip().upper()
+    except Exception:
+        intent = "MULTI"
 
-        intent_to_agents = {
-            "SUMMARISE": ['reader', 'summariser'],
-            "ANALYSE": ['reader', 'analyser'],
-            "QA": ['reader', 'qa'],
-            "WRITE": ['reader', 'summariser', 'writer'],
-            "MULTI": ['reader', 'summariser', 'analyser']
-        }
-        selected_agents = intent_to_agents.get(intent.upper(), ['reader', 'summariser', 'analyser'])
+    # Always fall back to MULTI if intent not in known map
+    VALID_INTENTS = ["SUMMARISE", "ANALYSE", "QA", "WRITE", "MULTI", "READ"]
+    if intent not in VALID_INTENTS:
+        intent = "MULTI"
 
-        for key in st.session_state.agent_states:
-            st.session_state.agent_states[key] = 'active' if key in selected_agents else 'idle'
-        st.rerun()
+    selected_agents = INTENT_MAP.get(intent, DEFAULT_AGENTS)
+    if not selected_agents:
+        selected_agents = DEFAULT_AGENTS
+    st.session_state.selected_agents = selected_agents
 
-    except Exception as e:
-        st.error(f"Intent detection error: {str(e)}")
-        st.session_state.is_running = False
+    # set all agent states
+    for k in st.session_state.agent_states:
+        st.session_state.agent_states[k] = (
+            'active' if k in selected_agents else 'idle'
+        )
 
-if st.session_state.is_running and st.session_state.last_query:
-    query = st.session_state.last_query
-    intent = st.session_state.orchestrator.detect_intent(query)
-
-    intent_to_agents = {
-        "SUMMARISE": ['reader', 'summariser'],
-        "ANALYSE": ['reader', 'analyser'],
-        "QA": ['reader', 'qa'],
-        "WRITE": ['reader', 'summariser', 'writer'],
-        "MULTI": ['reader', 'summariser', 'analyser']
-    }
-    selected_agents = intent_to_agents.get(intent.upper(), ['reader', 'summariser', 'analyser'])
+    # run each agent one by one with live spinner
+    predefined = get_predefined_configs()
 
     for agent_key in selected_agents:
-        if st.session_state.outputs[agent_key] is None:
+        with st.spinner(f"🤖 {AGENT_CONFIG[agent_key]['label']} is working..."):
             try:
-                search_results = st.session_state.vector_store.search(query,
-                                                                      st.session_state.collection_name,
-                                                                      n_results=5)
-                context_parts = [r["text"] for r in search_results]
-                context = "\n---\n".join(context_parts)
+                try:
+                    hits = st.session_state.vector_store.search(
+                        query,
+                        st.session_state.collection_name,
+                        n_results=5
+                    )
+                except Exception:
+                    hits = []
+
+                if hits:
+                    context = "\n---\n".join(h["text"] for h in hits)
+                else:
+                    # Fall back — load all stored chunks directly
+                    all_chunks = st.session_state.vector_store.store.get(
+                        st.session_state.collection_name, []
+                    )
+                    context = "\n---\n".join(
+                        c["text"] for c in all_chunks[:5]
+                    ) if all_chunks else "No document content available."
+
                 if len(context) > 3000:
                     context = context[:2997] + "..."
+                if not context.strip():
+                    context = "The document was uploaded but no text could be extracted."
 
-                predefined_configs = get_predefined_configs()
-                config = predefined_configs[agent_key]
-                task_desc = f"Document context:\n{context}\n\nTask: {query}"
-                expected = "A thorough, well-structured response based only on the document context"
+                cfg = predefined[agent_key]
+                task_desc = (
+                    "Document context:\n" + context +
+                    "\n\nTask: " + query
+                )
+                expected = (
+                    "A thorough well-structured response "
+                    "based only on the document context."
+                )
+                agent_obj, task_obj = build_crew_agent(
+                    cfg['role'], cfg['goal'], cfg['backstory'],
+                    task_desc, expected,
+                    model_name=st.session_state.selected_model
+                )
+                result = run_crew([(agent_obj, task_obj)])
+                result_str = str(result).strip()
+                if not result_str or result_str.lower() in [
+                    "none", "null", "", "n/a"
+                ]:
+                    result_str = (
+                        f"The {AGENT_CONFIG[agent_key]['label']} agent "
+                        f"processed the document but returned no output. "
+                        f"Try rephrasing your query."
+                    )
+                st.session_state.outputs[agent_key] = result_str
 
-                agent, task = build_crew_agent(config['role'], config['goal'], config['backstory'],
-                                               task_desc, expected, model_name=st.session_state.selected_model)
-                result = run_crew([(agent, task)])
-
-                st.session_state.outputs[agent_key] = result
-                st.session_state.agent_states[agent_key] = 'done'
-                st.rerun()
             except Exception as e:
-                st.session_state.outputs[agent_key] = f"Error: {str(e)}"
-                st.session_state.agent_states[agent_key] = 'done'
-                st.rerun()
+                st.session_state.outputs[agent_key] = (
+                    f"⚠️ Agent error: {str(e)}"
+                )
 
-    if all(st.session_state.outputs[key] is not None for key in selected_agents):
-        memory = st.session_state.memory
-        memory.add_turn('user', query)
-        combined_output = "\n\n---\n\n".join([out for out in st.session_state.outputs.values() if out])
-        memory.add_turn('assistant', combined_output)
-        st.session_state.token_count += len(query.split()) * 2 + 500 * len(selected_agents)
-        st.session_state.is_running = False
-        st.rerun()
+        st.session_state.agent_states[agent_key] = 'done'
 
-st.markdown('<div class="sec-label">OUTPUT_FEED RESULTS</div>', unsafe_allow_html=True)
-
-st.markdown("<div class='np-out-stack'>", unsafe_allow_html=True)
-
-descriptions = {
-    'reader': 'raw document extract',
-    'summariser': 'structured summary',
-    'analyser': 'critical analysis',
-    'qa': 'question answer',
-    'writer': 'generated document'
-}
-
-for key in ['reader', 'summariser', 'analyser', 'qa', 'writer']:
-    state = st.session_state.agent_states[key]
-    output = st.session_state.outputs.get(key)
-    icon = AGENT_CONFIG[key]['icon']
-    label = AGENT_CONFIG[key]['label']
-    desc = descriptions.get(key, '')
-
-    if state == 'active':
-        status_badge = "IN PROGRESS"
-    elif state == 'done':
-        status_badge = "COMPLETE"
-    else:
-        status_badge = "WAITING"
-
-    st.markdown(
-        dedent(
-            f"""
-            <div class="np-ocard {state}">
-                <div class="np-ohead">
-                    <div class="np-oicon">{icon}</div>
-                    <span class="np-otitle">{label} — {desc}</span>
-                    <span class="np-ostatus os-{state}">{status_badge}</span>
-                </div>
-            """
-        ).strip(),
-        unsafe_allow_html=True,
+    # update memory and token count
+    st.session_state.memory.add_turn('user', query)
+    combined = "\n\n---\n\n".join(
+        v for v in st.session_state.outputs.values() if v
     )
+    st.session_state.memory.add_turn('assistant', combined)
+    st.session_state.token_count += (
+        len(query.split()) * 2 + 500 * len(selected_agents)
+    )
+    st.session_state.is_running = False
+    st.rerun()
 
-    if state == 'active':
-        st.markdown(
-            dedent("""
-            <div class="np-obody">
-                <div class="shimmer-line f"></div>
-                <div class="shimmer-line m"></div>
-                <div class="shimmer-line f"></div>
-                <div class="shimmer-line s"></div>
-                <div class="shimmer-line m"></div>
-            </div>
-            """).strip(),
-            unsafe_allow_html=True,
+def build_output_cards():
+    descriptions = {
+        'reader':     'raw document extract',
+        'summariser': 'structured summary',
+        'analyser':   'critical analysis',
+        'qa':         'question answer',
+        'writer':     'generated document'
+    }
+    cards_html = '<div class="np-out-stack">'
+    for key in ['reader', 'summariser', 'analyser', 'qa', 'writer']:
+        state  = st.session_state.agent_states[key]
+        output = st.session_state.outputs.get(key)
+        icon   = AGENT_CONFIG[key]['icon']
+        label  = AGENT_CONFIG[key]['label']
+        desc   = descriptions[key]
+
+        if state == 'active':
+            status_text = 'IN PROGRESS'
+        elif state == 'done':
+            status_text = 'COMPLETE'
+        else:
+            status_text = 'WAITING'
+
+        card = (
+            '<div class="np-ocard ' + state + '">'
+            + '<div class="np-ohead">'
+            + '<div class="np-oicon">' + icon + '</div>'
+            + '<span class="np-otitle">' + label + ' — ' + desc + '</span>'
+            + '<span class="np-ostatus os-' + state + '">' + status_text + '</span>'
+            + '</div>'
         )
-    elif state == 'done' and output:
-        st.markdown("<div class='np-obody'>", unsafe_allow_html=True)
-        with st.expander(f"{icon} {label}", expanded=True):
-            st.markdown(output, unsafe_allow_html=False)
-        st.markdown("</div>", unsafe_allow_html=True)
-    else:
-        st.markdown("<div class='np-obody'></div>", unsafe_allow_html=True)
 
-    st.markdown("</div>", unsafe_allow_html=True)
+        if state == 'active':
+            card += (
+                '<div class="np-obody">'
+                + '<div class="shimmer-line f"></div>'
+                + '<div class="shimmer-line m"></div>'
+                + '<div class="shimmer-line f"></div>'
+                + '<div class="shimmer-line s"></div>'
+                + '</div>'
+            )
+        else:
+            card += '<div class="np-obody"></div>'
 
-st.markdown("</div>", unsafe_allow_html=True)
+        card += '</div>'
+        cards_html += card
+
+    cards_html += '</div>'
+    return cards_html
+
+st.markdown('<div class="sec-label">OUTPUT_FEED RESULTS</div>',
+            unsafe_allow_html=True)
+st.markdown(build_output_cards(), unsafe_allow_html=True)
+
+# Render actual output content using native Streamlit expanders
+# (these go AFTER the HTML cards, not inside them)
+for key in ['reader', 'summariser', 'analyser', 'qa', 'writer']:
+    state  = st.session_state.agent_states[key]
+    output = st.session_state.outputs.get(key)
+    if state == 'done' and output:
+        icon  = AGENT_CONFIG[key]['icon']
+        label = AGENT_CONFIG[key]['label']
+        with st.expander(icon + '  ' + label + ' output', expanded=True):
+            st.markdown(output)
+
 
 if any(st.session_state.outputs.values()):
     export_md = f"# Doc Dream Team — Session Export\n"

@@ -16,19 +16,35 @@ class OrchestratorAgent(BaseAgent):
         super().__init__(name="Orchestrator", system_prompt=system_prompt)
 
     def detect_intent(self, user_message: str) -> str:
-        intent_system_prompt = "Classify the user's request into exactly one of these intents: SUMMARISE, ANALYSE, QA, WRITE, READ, MULTI. Return only the intent word, nothing else."
-        
-        temp_orchestrator = BaseAgent(
-            name="IntentDetector",
-            system_prompt=intent_system_prompt,
-            model=self.model_name
-        )
-        response = temp_orchestrator.run(user_message)
-        intent = response.strip().upper()
-        
-        if intent not in self.VALID_INTENTS:
-            return "QA"
-        return intent
+        VALID = ["SUMMARISE", "ANALYSE", "QA", "WRITE", "MULTI", "READ"]
+        try:
+            from langchain_ollama import OllamaLLM
+            llm = OllamaLLM(
+                model=self.model_name,
+                base_url="http://localhost:11434"
+            )
+            prompt = (
+                "Classify this request into exactly one of these "
+                "intents: SUMMARISE, ANALYSE, QA, WRITE, MULTI, READ\n"
+                "Rules:\n"
+                "- SUMMARISE: user wants a summary or overview\n"
+                "- ANALYSE: user wants analysis, insights, critique\n"
+                "- QA: user asks a specific question about the doc\n"
+                "- WRITE: user wants to generate or write something\n"
+                "- READ: user wants to see the raw content\n"
+                "- MULTI: anything else or multiple tasks\n"
+                "Return ONLY the intent word. Nothing else.\n"
+                f"Request: {user_message}"
+            )
+            result = llm.invoke(prompt)
+            intent = str(result).strip().upper()
+            # extract just the intent word if LLM added extra text
+            for v in VALID:
+                if v in intent:
+                    return v
+            return "MULTI"
+        except Exception:
+            return "MULTI"
 
     def route(self, intent: str, user_message: str, context: str) -> str:
         if intent == "SUMMARISE":
