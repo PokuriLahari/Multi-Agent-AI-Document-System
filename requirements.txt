@@ -11,5 +11,3 @@ tiktoken
 fastapi
 uvicorn
 requests
-chromadb==0.4.24
-sentence-transformers

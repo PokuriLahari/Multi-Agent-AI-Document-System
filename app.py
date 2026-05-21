@@ -1,1037 +1,1081 @@
 import streamlit as st
 import streamlit.components.v1 as components
-import os, uuid, json
+import os
+import re
+import uuid
+import json
+import time
+import datetime
 from pathlib import Path
-from pipeline.chunker import chunk_document
-from pipeline.embedder import VectorStore
-from agents.orchestrator import OrchestratorAgent
-from agents.crew_builder import get_predefined_configs, build_crew_agent, run_crew
-from memory.store import SessionMemory
-from config import check_ollama_running, DEFAULT_MODEL
-
-AGENT_CONFIG = {
-    'reader':     {'icon': '🔍', 'label': 'Reader'},
-    'summariser': {'icon': '📋', 'label': 'Summariser'},
-    'analyser':   {'icon': '🧠', 'label': 'Analyser'},
-    'qa':         {'icon': '💬', 'label': 'Q&A'},
-    'writer':     {'icon': '✍️', 'label': 'Writer'}
-}
+from concurrent.futures import ThreadPoolExecutor, as_completed
 
 st.set_page_config(
     page_title="Doc Dream Team",
     page_icon="🧠",
     layout="wide",
-    initial_sidebar_state="collapsed"
+    initial_sidebar_state="expanded"
 )
 
+from pipeline.chunker import chunk_document
+from pipeline.embedder import VectorStore
+from agents.orchestrator import OrchestratorAgent
+from agents.crew_builder import (
+    build_crew_agent, run_crew, get_predefined_configs,
+    build_agent, build_task, PREDEFINED_CONFIGS
+)
+from memory.store import SessionMemory
+from config import check_ollama_running, DEFAULT_MODEL, OLLAMA_BASE_URL
+
+
+AGENT_CONFIG = {
+    'reader':     {'icon': '🔍', 'label': 'Reader',
+                   'desc': 'raw document extract'},
+    'summariser': {'icon': '📋', 'label': 'Summariser',
+                   'desc': 'structured summary'},
+    'analyser':   {'icon': '🧠', 'label': 'Analyser',
+                   'desc': 'critical analysis'},
+    'qa':         {'icon': '💬', 'label': 'Q&A',
+                   'desc': 'question answer'},
+    'writer':     {'icon': '✍️',  'label': 'Writer',
+                   'desc': 'generated document'},
+}
+
+INTENT_MAP = {
+    'SUMMARISE': ['reader', 'summariser'],
+    'ANALYSE':   ['reader', 'analyser'],
+    'QA':        ['reader', 'qa'],
+    'WRITE':     ['reader', 'summariser', 'writer'],
+    'MULTI':     ['reader', 'summariser', 'analyser'],
+    'READ':      ['reader'],
+}
+
+
 if not check_ollama_running():
-    st.error("Alert: Ollama is not running. Open a terminal and run:  ollama serve")
+    st.error("⚠️ Ollama is not running. Run: ollama serve")
     st.stop()
 
-if 'vector_store' not in st.session_state:
-    try:
-        st.session_state['vector_store'] = VectorStore()
-    except Exception as e:
-        st.error(f"VectorStore init failed: {e}")
-        st.stop()
 
+@st.cache_resource
+def load_vector_store():
+    from config import VECTOR_PATH
+    return VectorStore(persist_dir=VECTOR_PATH)
+
+@st.cache_resource
+def load_orchestrator():
+    return OrchestratorAgent()
+
+
+if 'vector_store' not in st.session_state:
+    st.session_state['vector_store'] = load_vector_store()
 if 'orchestrator' not in st.session_state:
-    try:
-        st.session_state['orchestrator'] = OrchestratorAgent()
-    except Exception as e:
-        st.error(f"Orchestrator init failed: {e}")
-        st.stop()
+    st.session_state['orchestrator'] = load_orchestrator()
 
 st.session_state.setdefault('memory', SessionMemory())
 st.session_state.setdefault('collection_name', None)
 st.session_state.setdefault('doc_meta', {})
 st.session_state.setdefault('run_count', 0)
 st.session_state.setdefault('token_count', 0)
-st.session_state.setdefault('session_id', str(uuid.uuid4())[:8].upper())
-if 'selected_model' not in st.session_state:
-    st.session_state['selected_model'] = DEFAULT_MODEL
+st.session_state.setdefault('session_id',
+    str(uuid.uuid4())[:8].upper())
+st.session_state.setdefault('selected_agents', [])
+st.session_state.setdefault('last_query', '')
 st.session_state.setdefault('agent_states', {
-    'reader': 'idle',
-    'summariser': 'idle',
-    'analyser': 'idle',
-    'qa': 'idle',
-    'writer': 'idle'
+    'reader': 'idle', 'summariser': 'idle',
+    'analyser': 'idle', 'qa': 'idle', 'writer': 'idle'
 })
 st.session_state.setdefault('outputs', {
     'reader': None, 'summariser': None,
     'analyser': None, 'qa': None, 'writer': None
 })
-st.session_state.setdefault('last_query', '')
-st.session_state.setdefault('is_running', False)
-st.session_state.setdefault('selected_agents', [])
+if 'selected_model' not in st.session_state:
+    st.session_state['selected_model'] = DEFAULT_MODEL
+if 'should_run' not in st.session_state:
+    st.session_state['should_run'] = False
+if 'agent_times' not in st.session_state:
+    st.session_state['agent_times'] = {
+        'reader': 0, 'summariser': 0, 'analyser': 0, 'qa': 0, 'writer': 0
+    }
+if 'query_history' not in st.session_state:
+    st.session_state['query_history'] = []
+if 'run_from_history' not in st.session_state:
+    st.session_state['run_from_history'] = None
+
+
+# Sidebar Query History (must be before main content)
+st.sidebar.markdown('<div class="sb-title">📜 QUERY HISTORY</div>', unsafe_allow_html=True)
+
+if st.sidebar.button("🗑️ Clear History", key="clear_history", help="Clear all history", use_container_width=True):
+    st.session_state.query_history = []
+    st.rerun()
+
+st.sidebar.markdown('<hr style="margin: 12px 0; border:none; border-top:1px solid rgba(139,92,246,0.1);">', unsafe_allow_html=True)
+
+if st.session_state.query_history:
+    for idx, item in enumerate(reversed(st.session_state.query_history[-20:])):
+        query_text = item.get('query', '')[:50]
+        doc_name = item.get('doc_name', '—')[:30]
+        timestamp = item.get('timestamp', '—')
+        
+        if st.sidebar.button(
+            f"🔍 {query_text}...",
+            key=f"hist_query_{idx}",
+            use_container_width=True,
+            help=f"Re-run: {item.get('query', '')}"
+        ):
+            st.session_state.run_from_history = {
+                'query': item['query'],
+                'collection': item['collection_name']
+            }
+            st.session_state.should_run = True
+            st.rerun()
+        
+        st.sidebar.markdown(
+            f"<div style='margin:-12px 0 12px 12px; font-size:10px; color:#4a4a70;'>"
+            f"📁 <span style='color:#5050a0;'>{doc_name}</span> · 🕐 {timestamp}"
+            f"</div>",
+            unsafe_allow_html=True
+        )
+else:
+    st.sidebar.markdown('<div style="color:#4a4a70; font-size:11px; padding:12px; text-align:center;">📭 No queries yet</div>', unsafe_allow_html=True)
+
 
 st.markdown(
     """
 <style>
-* { margin: 0; padding: 0; box-sizing: border-box; }
-body, .stApp { background: #07071a !important; color: #e0e0ff; font-family: 'Monaco', monospace; }
-
+#MainMenu, footer, header { visibility: hidden !important; }
+[data-testid="stToolbar"] { display: none !important; }
+[data-testid="stDecoration"] { display: none !important; }
+.stDeployButton { display: none !important; }
+.stApp, body { background: #07071a !important; }
 .block-container {
-    padding: 0 !important;
-    max-width: 100% !important;
+    padding: 0 !important; max-width: 100% !important;
 }
-
-[data-testid="stFileUploader"] {
-    margin: 0 28px 12px;
+[data-testid="stAppViewContainer"] {
+    padding-top: 0 !important;
 }
-
-.np-topbar {
-    display: flex;
-    justify-content: space-between;
-    align-items: center;
-    padding: 14px 28px;
-    border-bottom: 1px solid rgba(139, 92, 246, 0.15);
-    margin-bottom: 20px;
-    background: rgba(15, 15, 40, 0.8);
+[data-testid="stSidebar"] {
+    background: rgba(10,10,28,0.95) !important;
+    border-right: 1px solid rgba(139,92,246,0.15) !important;
 }
-
-.np-logo {
-    display: flex;
-    align-items: center;
-    gap: 8px;
+.sb-title {
+    font-size: 12px; letter-spacing: 2px;
+    color: rgba(167,139,250,0.6);
+    font-family: monospace; margin: 16px 0 12px;
+    text-transform: uppercase; font-weight: 700;
 }
-
-.np-logo-mark { font-size: 20px; }
-
-.np-logo-name {
-    font-size: 20px;
-    font-weight: 600;
-    color: #f0eeff;
-    letter-spacing: -0.3px;
+.sb-item {
+    background: rgba(139,92,246,0.08);
+    border: 1px solid rgba(139,92,246,0.2);
+    border-radius: 8px; padding: 10px 12px;
+    margin-bottom: 8px; cursor: pointer;
+    font-size: 12px; color: #d4d4f0;
+    transition: all 0.2s ease;
 }
-
-.np-logo-sub {
-    font-size: 12px;
-    color: #8888b0;
+.sb-item:hover {
+    background: rgba(139,92,246,0.15);
+    border-color: rgba(139,92,246,0.4);
+    transform: translateX(2px);
+}
+.sb-query {
+    font-weight: 600; color: #c4b5fd;
+    white-space: nowrap; overflow: hidden;
+    text-overflow: ellipsis;
+}
+.sb-doc {
+    font-size: 10px; color: #5050a0;
+    margin-top: 4px; white-space: nowrap;
+    overflow: hidden; text-overflow: ellipsis;
+}
+.sb-time {
+    font-size: 9px; color: #4a4a70;
     margin-top: 2px;
 }
-
-.np-pills {
-    display: flex;
-    gap: 12px;
+.np-topbar {
+    display: flex; align-items: center;
+    justify-content: space-between;
+    padding: 16px 32px;
+    border-bottom: 1px solid rgba(255,255,255,0.06);
+    background: rgba(10,10,28,0.98);
+    position: relative; z-index: 999;
 }
-
+.np-logo { display: flex; align-items: center; gap: 10px; }
+.np-logo-mark { font-size: 24px; }
+.np-logo-name {
+    font-size: 18px; font-weight: 700;
+    background: linear-gradient(135deg, #f0eeff 0%, #a78bfa 100%);
+    -webkit-background-clip: text;
+    -webkit-text-fill-color: transparent;
+    background-clip: text;
+}
+.np-logo-sub { font-size: 11px; color: #6060a0; margin-top: 2px; }
+.np-pills { display: flex; gap: 10px; }
 .np-pill {
-    display: flex;
-    align-items: center;
-    gap: 7px;
+    display: flex; align-items: center; gap: 7px;
     background: rgba(255,255,255,0.04);
-    border: 1px solid rgba(255,255,255,0.09);
-    border-radius: 999px;
-    padding: 6px 16px;
-    font-size: 12px;
-    color: #a0a0c0;
+    border: 1px solid rgba(255,255,255,0.1);
+    border-radius: 999px; padding: 6px 16px;
+    font-size: 12px; color: #9090b8; font-weight: 500;
 }
-
 .pd-green {
-    width: 8px;
-    height: 8px;
-    border-radius: 50%;
+    width: 8px; height: 8px; border-radius: 50%;
     background: #34d399;
-    box-shadow: 0 0 8px rgba(52, 211, 153, 0.5);
+    box-shadow: 0 0 8px rgba(52,211,153,0.6);
+    display: inline-block;
 }
-
 .np-stats {
-    display: grid;
-    grid-template-columns: repeat(4, 1fr);
-    gap: 12px;
-    margin: 0 28px 20px;
+    display: grid; grid-template-columns: repeat(4,1fr);
+    gap: 12px; margin: 20px 28px;
 }
-
 .np-stat {
     background: rgba(255,255,255,0.03);
     border: 1px solid rgba(139,92,246,0.18);
-    border-radius: 14px;
-    padding: 16px 18px;
-    text-align: center;
-    transition: border-color 0.3s, background 0.3s;
+    border-radius: 16px; padding: 18px;
+    box-shadow: 0 2px 12px rgba(0,0,0,0.4);
+    transition: border-color 0.3s, transform 0.2s;
 }
-
 .np-stat:hover {
     border-color: rgba(139,92,246,0.4);
-    background: rgba(139,92,246,0.05);
+    transform: translateY(-1px);
 }
-
 .np-stat-label {
-    font-size: 11px;
-    color: #7070a0;
-    letter-spacing: 1.5px;
-    margin-bottom: 6px;
-    font-family: monospace;
+    font-size: 10px; color: #6060a0; letter-spacing: 1.5px;
+    font-family: monospace; margin-bottom: 8px;
     text-transform: uppercase;
 }
-
 .np-stat-val {
-    font-size: 22px;
-    font-weight: 700;
-    color: #e8e6ff;
-    margin: 8px 0;
-    font-family: monospace;
+    font-size: 24px; font-weight: 800; color: #f0eeff;
+    font-family: monospace; letter-spacing: -0.5px;
 }
-
-.np-stat-sub {
-    font-size: 11px;
-    color: #5a5a80;
-    margin-top: 3px;
-}
-
+.np-stat-sub { font-size: 11px; color: #4a4a70; margin-top: 4px; }
 .sec-label {
-    font-size: 10px;
-    letter-spacing: 2.5px;
-    color: rgba(167,139,250,0.55);
-    font-family: monospace;
-    margin-bottom: 12px;
-    padding: 0 28px;
-    text-transform: uppercase;
-    margin-top: 20px;
+    font-size: 9px; letter-spacing: 3px;
+    color: rgba(167,139,250,0.5);
+    font-family: monospace; margin: 24px 0 12px;
+    padding: 0 28px; text-transform: uppercase;
+    font-weight: 700;
 }
-
-.np-dropzone {
-    margin: 0 28px 18px;
-    border: 1px dashed rgba(139,92,246,0.35);
-    border-radius: 14px;
-    padding: 36px;
-    text-align: center;
-    color: #7070a0;
-    font-size: 14px;
-    background: rgba(139,92,246,0.03);
-}
-
 .np-upload {
-    margin: 0 28px 18px;
-    padding: 16px 20px;
+    margin: 0 28px 16px; padding: 16px 20px;
     background: rgba(139,92,246,0.06);
     border: 1px solid rgba(139,92,246,0.25);
-    border-radius: 14px;
-    display: flex;
-    align-items: center;
-    gap: 16px;
+    border-radius: 14px; display: flex;
+    align-items: center; gap: 16px;
 }
-
-.np-upload-icon { font-size: 24px; }
-.np-upload-col { flex: 1; text-align: left; }
 .np-upload-name {
-    font-size: 14px;
-    font-weight: 600;
-    color: #e0deff;
+    font-size: 14px; font-weight: 600; color: #e0deff;
 }
-
-.np-upload-meta {
-    font-size: 11px;
-    color: #6060a0;
-    margin-top: 4px;
-}
-
+.np-upload-meta { font-size: 11px; color: #5050a0; margin-top: 4px; }
 .np-prog {
-    width: 100%;
-    height: 4px;
-    background: rgba(139, 92, 246, 0.1);
-    border-radius: 2px;
-    overflow: hidden;
-    margin-top: 8px;
+    height: 3px; background: rgba(139,92,246,0.1);
+    border-radius: 2px; margin-top: 8px; overflow: hidden;
 }
-
 .np-prog-fill {
     height: 100%;
-    background: linear-gradient(90deg, #a78bfa, #34d399);
-    width: 100%;
-    border-radius: 2px;
+    background: linear-gradient(90deg, #7c3aed, #34d399);
 }
-
+.np-dropzone {
+    margin: 0 28px 16px;
+    border: 1px dashed rgba(139,92,246,0.3);
+    border-radius: 14px; padding: 32px;
+    text-align: center; color: #6060a0;
+    font-size: 13px;
+    background: rgba(139,92,246,0.02);
+}
 .np-agents {
-    display: grid;
-    grid-template-columns: repeat(5, 1fr);
-    gap: 12px;
-    margin: 0 28px 20px;
+    display: grid; grid-template-columns: repeat(5,1fr);
+    gap: 12px; margin: 0 28px 20px;
 }
-
 .np-agent {
-    border-radius: 14px;
-    padding: 20px 10px 16px;
+    border-radius: 14px; padding: 20px 10px 16px;
     text-align: center;
-    background: rgba(255,255,255,0.03);
-    border: 1px solid rgba(167,139,250,0.15);
-    position: relative;
-    overflow: hidden;
-    transition: all 0.4s ease;
+    background: rgba(255,255,255,0.02);
+    border: 1px solid rgba(255,255,255,0.06);
+    box-shadow: 0 2px 10px rgba(0,0,0,0.3);
+    transition: all 0.3s ease;
 }
-
 .np-agent.done {
-    border-color: rgba(52,211,153,0.5);
+    border-color: rgba(52,211,153,0.45);
     background: rgba(52,211,153,0.05);
-    box-shadow: 0 0 20px rgba(52,211,153,0.07);
+    box-shadow: 0 2px 16px rgba(52,211,153,0.1);
 }
-
 .np-agent.active {
-    border-color: rgba(139,92,246,0.65);
-    background: rgba(139,92,246,0.08);
-    box-shadow: 0 0 24px rgba(139,92,246,0.12);
-    animation: card-pulse 2s infinite;
+    border-color: rgba(139,92,246,0.9);
+    background: rgba(139,92,246,0.14);
+    box-shadow: 0 0 28px rgba(139,92,246,0.35),
+                inset 0 0 16px rgba(139,92,246,0.08);
+    animation: card-pulse 1.5s infinite;
 }
-
 .np-agent.idle {
-    opacity: 0.45;
+    opacity: 0.75;
+    border-color: rgba(139,92,246,0.22);
 }
-
 @keyframes card-pulse {
-    0%, 100% { box-shadow: 0 0 0 0 rgba(139, 92, 246, 0.25); }
-    50% { box-shadow: 0 0 18px 6px rgba(139, 92, 246, 0.12); }
+    0%,100%{ box-shadow: 0 0 8px rgba(139,92,246,0.25),
+                      inset 0 0 8px rgba(139,92,246,0.04); }
+    50%    { box-shadow: 0 0 32px 8px rgba(139,92,246,0.3),
+                      inset 0 0 16px rgba(139,92,246,0.12); }
 }
-
 .np-av {
-    width: 44px;
-    height: 44px;
-    border-radius: 50%;
+    width: 44px; height: 44px; border-radius: 50%;
     margin: 0 auto 10px;
-    display: flex;
-    align-items: center;
-    justify-content: center;
-    font-size: 22px;
+    display: flex; align-items: center;
+    justify-content: center; font-size: 22px;
     position: relative;
 }
-
 .np-av.done   { background: rgba(52,211,153,0.18); }
-.np-av.active { background: rgba(139,92,246,0.22); animation: pulse 1s ease-in-out infinite; }
+.np-av.active { background: rgba(139,92,246,0.22); }
 .np-av.idle   { background: rgba(255,255,255,0.04); }
-
-@keyframes pulse {
-    0%, 100% { transform: scale(1); }
-    50% { transform: scale(1.1); }
-}
-
 .np-av-ring {
-    position: absolute;
-    width: 52px;
-    height: 52px;
-    border: 2px solid rgba(139, 92, 246, 0.5);
-    border-radius: 50%;
-    animation: rspin 2s linear infinite;
+    position: absolute; inset: -5px; border-radius: 50%;
+    border: 1px solid rgba(139,92,246,0.5);
+    animation: rspin 3s linear infinite;
 }
-
 .np-av-ring2 {
-    position: absolute;
-    width: 60px;
-    height: 60px;
-    border: 1px dashed rgba(139, 92, 246, 0.3);
-    border-radius: 50%;
-    animation: rspin 3s linear infinite reverse;
+    position: absolute; inset: -5px; border-radius: 50%;
+    border: 1px dashed rgba(139,92,246,0.2);
+    animation: rspin 6s linear infinite reverse;
 }
-
 @keyframes rspin {
-    0% { transform: rotate(0deg); }
-    100% { transform: rotate(360deg); }
+    from{transform:rotate(0deg);} to{transform:rotate(360deg);}
 }
-
 .np-aname {
-    font-size: 14px;
-    font-weight: 600;
-    color: #e0deff;
-    margin-top: 4px;
-    letter-spacing: 0.2px;
+    font-size: 13px; font-weight: 700; color: #e0deff;
+    margin-top: 6px; letter-spacing: 0.2px;
 }
-
 .np-abadge {
-    display: inline-flex;
-    align-items: center;
-    gap: 5px;
-    margin-top: 6px;
-    font-size: 11px;
-    padding: 3px 10px;
-    border-radius: 999px;
-    font-weight: 500;
-    text-transform: uppercase;
-    letter-spacing: 0.5px;
+    display: inline-flex; align-items: center; gap: 4px;
+    margin-top: 6px; font-size: 9px; padding: 3px 10px;
+    border-radius: 999px; font-weight: 700;
+    letter-spacing: 1px; text-transform: uppercase;
 }
-
-.np-abadge.nb-done {
-    background: rgba(52, 211, 153, 0.2);
-    color: #34d399;
+.nb-done {
+    background: rgba(52,211,153,0.15); color: #34d399;
+    border: 1px solid rgba(52,211,153,0.3);
 }
-
-.np-abadge.nb-active {
-    background: rgba(139, 92, 246, 0.2);
-    color: #a78bfa;
-    animation: blink 1.5s ease-in-out infinite;
+.nb-active {
+    background: rgba(139,92,246,0.2); color: #c4b5fd;
+    border: 1px solid rgba(139,92,246,0.4);
+    animation: blink 1.5s infinite;
 }
-
-.np-abadge.nb-idle {
-    background: rgba(60, 60, 90, 0.2);
-    color: #6a6a9a;
+.nb-idle {
+    background: rgba(139,92,246,0.08); color: #8b7cfa;
+    border: 1px solid rgba(139,92,246,0.22);
 }
-
 @keyframes blink {
-    0%, 100% { opacity: 1; }
-    50% { opacity: 0.4; }
+    0%,100%{opacity:1;} 50%{opacity:0.35;}
 }
-
+.bdot {
+    display: inline-block; width: 5px; height: 5px;
+    border-radius: 50%; background: currentColor;
+}
 .np-out-stack {
-    display: flex;
-    flex-direction: column;
-    gap: 12px;
-    margin: 0 28px 20px;
+    display: flex; flex-direction: column;
+    gap: 10px; margin: 0 28px 20px;
 }
-
 .np-ocard {
-    background: rgba(255,255,255,0.025);
-    border: 1px solid rgba(167,139,250,0.12);
-    border-radius: 14px;
-    margin-bottom: 4px;
-    overflow: hidden;
-    transition: border-color 0.3s ease, background 0.3s ease, box-shadow 0.3s ease;
+    background: rgba(255,255,255,0.02);
+    border: 1px solid rgba(255,255,255,0.06);
+    border-radius: 14px; overflow: hidden;
+    box-shadow: 0 2px 12px rgba(0,0,0,0.35);
+    transition: all 0.3s ease;
 }
-
-.np-ocard.idle {
-    opacity: 0.45;
+.np-ocard.done {
+    border-color: rgba(52,211,153,0.28);
+    background: rgba(52,211,153,0.03);
 }
-
 .np-ocard.active {
     border-color: rgba(139,92,246,0.5);
     background: rgba(139,92,246,0.05);
-    box-shadow: 0 0 20px rgba(139,92,246,0.1);
+    box-shadow: 0 0 24px rgba(139,92,246,0.1);
 }
-
-.np-ocard.done {
-    border-color: rgba(52,211,153,0.3);
-    background: rgba(52,211,153,0.03);
-}
-
+.np-ocard.idle { opacity: 0.38; }
 .np-ohead {
-    display: flex;
-    align-items: center;
-    gap: 12px;
+    display: flex; align-items: center; gap: 12px;
     padding: 14px 18px;
 }
-
 .np-oicon {
-    width: 32px;
-    height: 32px;
-    border-radius: 8px;
-    display: flex;
-    align-items: center;
-    justify-content: center;
-    font-size: 16px;
-    flex-shrink: 0;
+    width: 32px; height: 32px; border-radius: 8px;
+    display: flex; align-items: center;
+    justify-content: center; font-size: 16px; flex-shrink: 0;
 }
-
+.oi-done   { background: rgba(52,211,153,0.14); }
+.oi-active { background: rgba(139,92,246,0.18); }
+.oi-idle   { background: rgba(255,255,255,0.04); }
 .np-otitle {
-    font-size: 14px;
-    font-weight: 600;
-    color: #e8e6ff;
-    flex: 1;
+    font-size: 14px; font-weight: 700; color: #f0eeff; flex: 1;
 }
-
 .np-ostatus {
-    font-size: 11px;
-    padding: 3px 11px;
-    border-radius: 999px;
-    font-weight: 500;
-    margin-left: auto;
-    text-transform: uppercase;
+    font-size: 10px; padding: 3px 11px;
+    border-radius: 999px; font-weight: 700;
+    letter-spacing: 0.5px;
 }
-
-.os-done   { background: rgba(52,211,153,0.14);  color: #6ee7b7; }
-.os-active { background: rgba(139,92,246,0.16);  color: #c4b5fd; }
-.os-idle   { background: rgba(255,255,255,0.05); color: #4a4a70; }
-
+.os-done {
+    background: rgba(52,211,153,0.14); color: #34d399;
+    border: 1px solid rgba(52,211,153,0.25);
+}
+.os-active {
+    background: rgba(139,92,246,0.16); color: #c4b5fd;
+    border: 1px solid rgba(139,92,246,0.3);
+}
+.os-idle {
+    background: rgba(255,255,255,0.04); color: #3a3a60;
+    border: 1px solid rgba(255,255,255,0.05);
+}
 .np-obody {
     padding: 8px 18px 16px;
     border-top: 1px solid rgba(139,92,246,0.08);
-    font-size: 13px;
-    color: #a0a0c8;
-    line-height: 1.9;
 }
-
-.shimmer-line {
-    height: 8px;
-    background: linear-gradient(90deg, rgba(139,92,246,0.1), rgba(139,92,246,0.3), rgba(139,92,246,0.1));
-    margin: 8px 0;
-    border-radius: 4px;
-    animation: shimmer 1.5s infinite;
+.shim-line {
+    height: 7px; border-radius: 3px; margin-top: 9px;
+    background: linear-gradient(90deg,
+        rgba(139,92,246,0.05) 25%,
+        rgba(139,92,246,0.2) 50%,
+        rgba(139,92,246,0.05) 75%);
+    background-size: 200% 100%;
+    animation: shim 1.8s infinite;
 }
-
-.shimmer-line.f { width: 100%; }
-.shimmer-line.m { width: 85%; }
-.shimmer-line.s { width: 60%; }
-
-@keyframes shimmer {
-    0% { opacity: 0.5; }
-    50% { opacity: 1; }
-    100% { opacity: 0.5; }
+@keyframes shim {
+    0%{background-position:200% 0;}
+    100%{background-position:-200% 0;}
 }
-
+.stTextInput > div > div > input {
+    background: rgba(255,255,255,0.04) !important;
+    border: 1px solid rgba(139,92,246,0.25) !important;
+    border-radius: 10px !important; color: #e0deff !important;
+    font-size: 13px !important;
+}
+.stButton > button {
+    background: rgba(139,92,246,0.22) !important;
+    border: 1px solid rgba(167,139,250,0.4) !important;
+    border-radius: 10px !important; color: #c4b5fd !important;
+    font-weight: 700 !important; font-size: 13px !important;
+}
+.stButton > button:hover {
+    background: rgba(139,92,246,0.38) !important;
+}
+.stSelectbox > div > div {
+    background: rgba(255,255,255,0.03) !important;
+    border: 1px solid rgba(139,92,246,0.2) !important;
+    border-radius: 8px !important; color: #d4d4f0 !important;
+}
+.streamlit-expanderHeader {
+    background: rgba(139,92,246,0.08) !important;
+    border-radius: 8px !important; color: #c4b5fd !important;
+    font-size: 13px !important; font-weight: 600 !important;
+}
 </style>
-""",
-    unsafe_allow_html=True,
+    """,
+    unsafe_allow_html=True
 )
+
+with st.sidebar:
+    st.markdown(
+        '<div style="display:flex; justify-content:space-between; align-items:center;">'
+        '<div class="sb-title">📜 QUERY HISTORY</div>'
+        '<button style="background:none; border:none; cursor:pointer; font-size:16px; padding:0; margin:0;" '
+        'onclick="this.parentElement.nextElementSibling.value=\'CLEAR\'; this.parentElement.nextElementSibling.click();">🗑️</button>'
+        '</div>',
+        unsafe_allow_html=True
+    )
+
 
 st.markdown(
     '<div class="np-topbar">'
-    + '<div class="np-logo">'
-    + '<span class="np-logo-mark">Brain</span>'
-    + '<span class="np-logo-name">Doc Dream Team</span>'
-    + '<span class="np-logo-sub">multi-agent document intelligence</span>'
-    + '</div>'
-    + '<div class="np-pills">'
-    + '<div class="np-pill">'
-    + '<span class="pd-green"></span>'
-    + 'Ollama · ' + DEFAULT_MODEL
-    + '</div>'
-    + '<div class="np-pill">'
-    + '📦 VectorStore ready'
-    + '</div>'
-    + '</div>'
-    + '</div>',
-    unsafe_allow_html=True,
+    '<div class="np-logo">'
+    '<span class="np-logo-mark">🧠</span>'
+    '<div>'
+    '<div class="np-logo-name">Doc Dream Team</div>'
+    '<div class="np-logo-sub">multi-agent document intelligence</div>'
+    '</div>'
+    '</div>'
+    '<div class="np-pills">'
+    '<div class="np-pill">'
+    '<span class="pd-green"></span>'
+    f'Ollama · {DEFAULT_MODEL}'
+    '</div>'
+    '<div class="np-pill">📦 VectorStore ready</div>'
+    f'<div class="np-pill">🔑 {st.session_state.session_id}</div>'
+    '</div>'
+    '</div>',
+    unsafe_allow_html=True
 )
 
+
 agent_states_json = json.dumps(st.session_state.agent_states)
-session_id = st.session_state.session_id
 chunk_count = st.session_state.doc_meta.get('chunks', 0)
-token_count = st.session_state.token_count
+session_id = st.session_state.session_id
 
-neural_canvas_html = f"""
-<div style="width:100%; height:240px; background:#07071a; position:relative; overflow:hidden;">
-<style>
-    .nc-hud {{ position: absolute; z-index: 2; pointer-events: none; font-family: ui-monospace, monospace; }}
-    .nc-hud-tl {{ top: 12px; left: 12px; }}
-    .nc-hud-tr {{ top: 12px; right: 12px; text-align: right; }}
-    .nc-hud-br {{ bottom: 12px; right: 12px; text-align: right; }}
-</style>
-<canvas id="nc" style="position:absolute; top:0; left:0; width:100%; height:100%; display:block; z-index:1;"></canvas>
-<div class="nc-hud nc-hud-tl">
-    <div style="font-size:10px; letter-spacing:3px; text-transform:uppercase; color:rgba(167,139,250,0.6);">NEURAL MESH</div>
-    <span style="font-size:32px; font-weight:700; color:#d4b8ff; line-height:1.15; display:block; margin:4px 0;">{chunk_count}</span>
-    <div style="font-size:10px; color:rgba(167,139,250,0.4); text-transform:uppercase; letter-spacing:1px;">CHUNKS LOADED</div>
+canvas_html = f"""<!DOCTYPE html>
+<html><head><style>
+body {{ margin:0; background:#07071a; overflow:hidden; }}
+canvas {{ display:block; }}
+.hud {{ position:absolute; pointer-events:none;
+        font-family:monospace; }}
+.tl {{ top:14px; left:18px; }}
+.tr {{ top:14px; right:18px; text-align:right; }}
+.br {{ bottom:10px; right:18px; }}
+.ht {{ font-size:9px; color:rgba(167,139,250,0.5);
+       letter-spacing:2px; text-transform:uppercase; }}
+.hv {{ font-size:28px; font-weight:800; color:#d4b8ff;
+       line-height:1.1; }}
+.hs {{ font-size:9px; color:rgba(167,139,250,0.35);
+       margin-top:2px; text-transform:uppercase; }}
+.hm {{ font-size:10px; color:rgba(167,139,250,0.4);
+       margin-top:4px; }}
+.hm span {{ color:#b8a0ff; font-weight:700; }}
+</style></head>
+<body>
+<canvas id="c"></canvas>
+<div class="hud tl">
+  <div class="ht">NEURAL MESH</div>
+  <div class="hv">{chunk_count}</div>
+  <div class="hs">CHUNKS LOADED</div>
 </div>
-<div class="nc-hud nc-hud-tr">
-    <div style="font-size:11px; color:rgba(167,139,250,0.55); text-transform:uppercase; letter-spacing:0.5px;">TOKENS PROCESSED</div>
-    <div><span id="token-display" style="font-size:13px; font-weight:700; color:#b8a0ff;">{token_count}</span></div>
-    <div style="font-size:11px; color:rgba(167,139,250,0.55); text-transform:uppercase; margin-top:6px; letter-spacing:0.5px;">VECTOR DIMS 4096</div>
+<div class="hud tr">
+  <div class="hm">TOKENS <span id="tok">0</span></div>
+  <div class="hm">DIMS <span>4096</span></div>
+  <div class="hm">SIM <span id="sim">—</span></div>
 </div>
-<div class="nc-hud nc-hud-br">
-    <div style="font-size:11px; color:rgba(167,139,250,0.55); text-transform:uppercase;">SESSION ID</div>
-    <div><span style="font-size:12px; font-weight:700; color:#b8a0ff;">{session_id}</span></div>
+<div class="hud br">
+  <div class="hm">SESSION <span>{session_id}</span></div>
 </div>
-</div>
-
 <script>
-    const cv = document.getElementById('nc');
-    const ctx = cv.getContext('2d');
-    let particles = [];
-    let agentStates = {agent_states_json};
-    let tokenCount = {token_count};
-
-    function resize() {{
-        const W = cv.parentElement.offsetWidth || window.innerWidth || 900;
-        const H = 240;
-        cv.width = W;
-        cv.height = H;
+const cv=document.getElementById('c');
+const ctx=cv.getContext('2d');
+let W,H,pts=[],states={agent_states_json};
+const keys=['reader','summariser','analyser','qa','writer'];
+const labels=['R','S','A','Q','W'];
+function resize(){{
+  W=cv.width=window.innerWidth;
+  H=cv.height=200;
+}}
+resize();
+window.onresize=resize;
+for(let i=0;i<75;i++){{
+  pts.push({{
+    x:Math.random()*1000,y:Math.random()*200,
+    vx:(Math.random()-.5)*.5,vy:(Math.random()-.5)*.5
+  }});
+}}
+function draw(){{
+  ctx.fillStyle='#07071a';ctx.fillRect(0,0,W,H);
+  pts.forEach(p=>{{
+    p.x+=p.vx;p.y+=p.vy;
+    if(p.x<0||p.x>W)p.vx*=-1;
+    if(p.y<0||p.y>H)p.vy*=-1;
+  }});
+  for(let i=0;i<pts.length;i++){{
+    for(let j=i+1;j<pts.length;j++){{
+      const dx=pts[i].x-pts[j].x,dy=pts[i].y-pts[j].y;
+      const d=Math.sqrt(dx*dx+dy*dy);
+      if(d<85){{
+        ctx.strokeStyle=`rgba(139,92,246,${{.09*(1-d/85)}})`;
+        ctx.lineWidth=.5;ctx.beginPath();
+        ctx.moveTo(pts[i].x,pts[i].y);
+        ctx.lineTo(pts[j].x,pts[j].y);ctx.stroke();
+      }}
     }}
-    resize();
-    window.addEventListener('resize', function() {{
-        resize();
-        seedParticles();
-    }});
-
-    class Particle {{
-        constructor() {{
-            this.x = Math.random() * cv.width;
-            this.y = Math.random() * cv.height;
-            this.vx = (Math.random() - 0.5) * 2;
-            this.vy = (Math.random() - 0.5) * 2;
-            this.radius = 1.2;
-        }}
-
-        update() {{
-            this.x += this.vx;
-            this.y += this.vy;
-            if (this.x <= 0 || this.x >= cv.width) this.vx *= -1;
-            if (this.y <= 0 || this.y >= cv.height) this.vy *= -1;
-            this.x = Math.max(0, Math.min(cv.width, this.x));
-            this.y = Math.max(0, Math.min(cv.height, this.y));
-        }}
-
-        draw() {{
-            ctx.fillStyle = 'rgba(167, 139, 250, 0.25)';
-            ctx.beginPath();
-            ctx.arc(this.x, this.y, this.radius, 0, Math.PI * 2);
-            ctx.fill();
-        }}
+  }}
+  pts.forEach(p=>{{
+    ctx.fillStyle='rgba(167,139,250,.25)';
+    ctx.beginPath();ctx.arc(p.x,p.y,1.2,0,Math.PI*2);
+    ctx.fill();
+  }});
+  const t=Date.now()*.001;
+  keys.forEach((k,i)=>{{
+    const x=W*[.12,.28,.50,.72,.88][i],y=H*.48;
+    const s=states[k]||'idle';
+    const pulse=s==='active'?(Math.sin(t*2.5+i)*.5+.5):0;
+    if(s==='active'){{
+      ctx.beginPath();ctx.arc(x,y,28+pulse*10,0,Math.PI*2);
+      ctx.fillStyle=`rgba(139,92,246,${{.06+pulse*.06}})`;
+      ctx.fill();
     }}
-
-    function seedParticles() {{
-        particles = [];
-        for (let i = 0; i < 75; i++) {{
-            particles.push(new Particle());
-        }}
+    if(s==='done'){{
+      ctx.beginPath();ctx.arc(x,y,22,0,Math.PI*2);
+      ctx.fillStyle='rgba(52,211,153,.08)';ctx.fill();
     }}
-    seedParticles();
-
-    function drawAgentNode(x, y, label, state) {{
-        const radius = 14;
-
-        if (state === 'done') {{
-            ctx.fillStyle = 'rgba(52, 211, 153, 0.07)';
-            ctx.beginPath();
-            ctx.arc(x, y, radius * 1.8, 0, Math.PI * 2);
-            ctx.fill();
-            ctx.strokeStyle = '#34d399';
-            ctx.lineWidth = 1.5;
-        }} else if (state === 'active') {{
-            const pulse = Math.sin(Date.now() / 1000 * 2.5) * 0.5 + 0.5;
-            ctx.fillStyle = 'rgba(139, 92, 246, 0.07)';
-            ctx.beginPath();
-            ctx.arc(x, y, radius * (1.5 + pulse * 0.5), 0, Math.PI * 2);
-            ctx.fill();
-            ctx.strokeStyle = '#a78bfa';
-            ctx.lineWidth = 2;
-        }} else {{
-            ctx.fillStyle = 'rgba(30, 30, 60, 0.5)';
-            ctx.strokeStyle = 'rgba(60, 60, 90, 0.4)';
-            ctx.lineWidth = 1;
-            ctx.globalAlpha = 0.4;
-        }}
-
-        ctx.beginPath();
-        ctx.arc(x, y, radius, 0, Math.PI * 2);
-        ctx.fill();
-        ctx.stroke();
-        ctx.globalAlpha = 1;
-
-        ctx.fillStyle = '#a78bfa';
-        ctx.font = 'bold 10px monospace';
-        ctx.textAlign = 'center';
-        ctx.textBaseline = 'middle';
-        ctx.fillText(label, x, y);
+    ctx.beginPath();ctx.arc(x,y,14,0,Math.PI*2);
+    ctx.fillStyle=s==='done'?'rgba(52,211,153,.18)':
+                 s==='active'?'rgba(139,92,246,.28)':
+                 'rgba(25,25,55,.6)';
+    ctx.fill();
+    ctx.strokeStyle=s==='done'?'#34d399':
+                    s==='active'?'#a78bfa':
+                    'rgba(60,60,100,.4)';
+    ctx.lineWidth=1.5;ctx.stroke();
+    ctx.fillStyle=s==='done'?'#34d399':
+                 s==='active'?'#c4b5fd':
+                 'rgba(80,80,130,.5)';
+    ctx.font='700 10px monospace';
+    ctx.textAlign='center';ctx.textBaseline='middle';
+    ctx.fillText(labels[i],x,y);
+    if(s==='active'){{
+      const a=t*1.8;
+      ctx.beginPath();ctx.arc(x,y,20,a,a+1.4);
+      ctx.strokeStyle='rgba(167,139,250,.6)';
+      ctx.lineWidth=1.5;ctx.stroke();
     }}
-
-    function animate() {{
-        ctx.fillStyle = '#07071a';
-        ctx.fillRect(0, 0, cv.width, cv.height);
-
-        for (let p of particles) {{
-            p.update();
-        }}
-
-        for (let i = 0; i < particles.length; i++) {{
-            for (let j = i + 1; j < particles.length; j++) {{
-                const dx = particles[j].x - particles[i].x;
-                const dy = particles[j].y - particles[i].y;
-                const dist = Math.sqrt(dx * dx + dy * dy);
-
-                if (dist < 90) {{
-                    const opacity = 0.09 * (1 - dist / 90);
-                    ctx.strokeStyle = 'rgba(139, 92, 246,' + opacity + ')';
-                    ctx.lineWidth = 0.5;
-                    ctx.beginPath();
-                    ctx.moveTo(particles[i].x, particles[i].y);
-                    ctx.lineTo(particles[j].x, particles[j].y);
-                    ctx.stroke();
-                }}
-            }}
-        }}
-
-        for (let p of particles) {{
-            p.draw();
-        }}
-
-        const nodePositions = [
-            {{ x: cv.width * 0.15, label: 'R' }},
-            {{ x: cv.width * 0.28, label: 'S' }},
-            {{ x: cv.width * 0.50, label: 'A' }},
-            {{ x: cv.width * 0.72, label: 'Q' }},
-            {{ x: cv.width * 0.85, label: 'W' }}
-        ];
-
-        const nodeLabels = ['reader', 'summariser', 'analyser', 'qa', 'writer'];
-        const y = cv.height * 0.45;
-
-        for (let i = 0; i < nodePositions.length; i++) {{
-            const state = agentStates[nodeLabels[i]] || 'idle';
-            drawAgentNode(nodePositions[i].x, y, nodePositions[i].label, state);
-        }}
-
-        ctx.strokeStyle = 'rgba(139, 92, 246, 0.35)';
-        ctx.lineWidth = 1;
-        ctx.setLineDash([4, 6]);
-        for (let i = 0; i < nodePositions.length - 1; i++) {{
-            ctx.beginPath();
-            ctx.moveTo(nodePositions[i].x, y);
-            ctx.lineTo(nodePositions[i + 1].x, y);
-            ctx.stroke();
-        }}
-        ctx.setLineDash([]);
-
-        requestAnimationFrame(animate);
-    }}
-
-    animate();
-
-    setInterval(function() {{
-        tokenCount += Math.floor(Math.random() * 14) + 4;
-        const el = document.getElementById('token-display');
-        if (el) el.textContent = tokenCount;
-    }}, 700);
+  }});
+  requestAnimationFrame(draw);
+}}
+draw();
+let tok=0;
+setInterval(()=>{{
+  tok+=Math.floor(Math.random()*14+4);
+  const e=document.getElementById('tok');
+  if(e)e.textContent=tok.toLocaleString();
+}},700);
+setInterval(()=>{{
+  const e=document.getElementById('sim');
+  if(e)e.textContent=(0.82+Math.random()*.12).toFixed(2);
+}},1500);
 </script>
-"""
+</body></html>"""
 
-components.html(neural_canvas_html, height=240, scrolling=False)
+st.html(canvas_html)
+
+
+active_count = sum(
+    1 for s in st.session_state.agent_states.values()
+    if s in ('active', 'done')
+)
+doc_name = st.session_state.doc_meta.get('name', '—')
+if len(doc_name) > 18:
+    doc_name = doc_name[:15] + '...'
 
 st.markdown(
     '<div class="np-stats">'
-    + '<div class="np-stat">'
-    + '<div class="np-stat-label">DOCUMENT</div>'
-    + '<div class="np-stat-val">' + str(st.session_state.doc_meta.get('name', 'N/A')) + '</div>'
-    + '<div class="np-stat-sub">' + str(st.session_state.doc_meta.get('chunks', 0)) + ' chunks</div>'
-    + '</div>'
-    + '<div class="np-stat">'
-    + '<div class="np-stat-label">ACTIVE AGENTS</div>'
-    + '<div class="np-stat-val">' + str(sum(1 for v in st.session_state.agent_states.values() if v in ['active', 'done'])) + '</div>'
-    + '<div class="np-stat-sub">of 5 total</div>'
-    + '</div>'
-    + '<div class="np-stat">'
-    + '<div class="np-stat-label">SESSION RUNS</div>'
-    + '<div class="np-stat-val">' + str(st.session_state.run_count) + '</div>'
-    + '<div class="np-stat-sub">this session</div>'
-    + '</div>'
-    + '<div class="np-stat">'
-    + '<div class="np-stat-label">MODEL</div>'
-    + '<div class="np-stat-val">' + DEFAULT_MODEL + '</div>'
-    + '<div class="np-stat-sub">local free</div>'
-    + '</div>'
-    + '</div>',
-    unsafe_allow_html=True,
+    '<div class="np-stat">'
+    '<div class="np-stat-label">DOCUMENT</div>'
+    f'<div class="np-stat-val">{doc_name}</div>'
+    '<div class="np-stat-sub">'
+    f'{st.session_state.doc_meta.get("chunks",0)} chunks'
+    '</div>'
+    '</div>'
+    '<div class="np-stat">'
+    '<div class="np-stat-label">ACTIVE AGENTS</div>'
+    f'<div class="np-stat-val">{active_count} / 5</div>'
+    '<div class="np-stat-sub">of 5 total</div>'
+    '</div>'
+    '<div class="np-stat">'
+    '<div class="np-stat-label">SESSION RUNS</div>'
+    f'<div class="np-stat-val">{st.session_state.run_count}</div>'
+    '<div class="np-stat-sub">this session</div>'
+    '</div>'
+    '<div class="np-stat">'
+    '<div class="np-stat-label">MODEL</div>'
+    f'<div class="np-stat-val">{st.session_state.selected_model}</div>'
+    '<div class="np-stat-sub">local · free</div>'
+    '</div>'
+    '</div>',
+    unsafe_allow_html=True
 )
 
-st.markdown('<div class="sec-label">DOCUMENT_LOAD INPUT</div>', unsafe_allow_html=True)
 
-uploaded_file = st.file_uploader("", type=["pdf", "docx", "txt"], label_visibility="collapsed")
+st.markdown('<div class="sec-label">DOCUMENT LOAD</div>',
+            unsafe_allow_html=True)
 
-if uploaded_file is not None:
-    upload_path = Path("uploads") / uploaded_file.name
-    upload_path.parent.mkdir(exist_ok=True)
-    with open(upload_path, "wb") as f:
-        f.write(uploaded_file.getbuffer())
+uploaded = st.file_uploader(
+    "Upload document",
+    type=["pdf", "docx", "txt"],
+    label_visibility="collapsed"
+)
 
-    chunks = chunk_document(str(upload_path))
-    collection_name = upload_path.stem
-
-    st.session_state.vector_store.ingest(chunks, collection_name=collection_name)
-    st.session_state.collection_name = collection_name
-    st.session_state.doc_meta = {
-        'name': uploaded_file.name,
-        'chunks': len(chunks),
-        'size_kb': round(uploaded_file.size / 1024, 1)
-    }
-    st.session_state.agent_states = {k: 'idle' for k in st.session_state.agent_states}
-    st.session_state.outputs = {k: None for k in st.session_state.outputs}
-
-    st.markdown(
-        '<div class="np-upload">'
-        + '<div class="np-upload-icon">📄</div>'
-        + '<div class="np-upload-col">'
-        + '<div class="np-upload-name">' + uploaded_file.name + '</div>'
-        + '<div class="np-upload-meta">' + str(len(chunks)) + ' chunks · ' + str(round(uploaded_file.size/1024, 1)) + ' KB</div>'
-        + '<div class="np-prog"><div class="np-prog-fill"></div></div>'
-        + '</div>'
-        + '</div>',
-        unsafe_allow_html=True,
-    )
-
-    st.success(f"Success: {len(chunks)} chunks ingested into VectorStore")
+if uploaded:
+    os.makedirs("uploads", exist_ok=True)
+    fpath = f"uploads/{uploaded.name}"
+    with open(fpath, "wb") as f:
+        f.write(uploaded.getbuffer())
+    with st.spinner("Chunking and embedding..."):
+        try:
+            chunks = chunk_document(fpath)
+            raw = Path(uploaded.name).stem
+            cname = re.sub(r'[^a-zA-Z0-9_-]', '_', raw).strip('_-')
+            if len(cname) < 2:
+                cname = 'document'
+            cname = cname[:100]
+            st.session_state.vector_store.ingest(chunks, cname)
+            st.session_state.collection_name = cname
+            st.session_state.doc_meta = {
+                'name': uploaded.name,
+                'chunks': len(chunks),
+                'size_kb': round(uploaded.size / 1024, 1)
+            }
+            for k in st.session_state.agent_states:
+                st.session_state.agent_states[k] = 'idle'
+            for k in st.session_state.outputs:
+                st.session_state.outputs[k] = None
+            m = st.session_state.doc_meta
+            st.markdown(
+                '<div class="np-upload">'
+                '<span style="font-size:22px">📄</span>'
+                '<div style="flex:1">'
+                f'<div class="np-upload-name">{m["name"]}</div>'
+                f'<div class="np-upload-meta">'
+                f'{m["chunks"]} chunks · {m["size_kb"]} KB</div>'
+                '<div class="np-prog">'
+                '<div class="np-prog-fill"></div></div>'
+                '</div></div>',
+                unsafe_allow_html=True
+            )
+            st.success(f"✅ {len(chunks)} chunks ready")
+        except Exception as e:
+            st.error(f"Upload error: {e}")
 else:
-    st.markdown(
-        '<div class="np-dropzone">'
-        + 'Drop a document to begin — PDF, DOCX, or TXT'
-        + '</div>',
-        unsafe_allow_html=True,
-    )
-
-st.markdown('<div class="sec-label">AGENT_STATUS LIVE</div>', unsafe_allow_html=True)
-
-def build_agent_cards():
-    cards = []
-    for key in ['reader', 'summariser', 'analyser', 'qa', 'writer']:
-        state = st.session_state.agent_states[key]
-        icon  = AGENT_CONFIG[key]['icon']
-        label = AGENT_CONFIG[key]['label']
-
-        if state == 'active':
-            badge = 'WORKING'
-            rings = '<div class="np-av-ring"></div><div class="np-av-ring2"></div>'
-        elif state == 'done':
-            badge = 'DONE'
-            rings = ''
-        else:
-            badge = 'WAITING'
-            rings = ''
-
-        cards.append(
-            '<div class="np-agent ' + state + '">'
-            + '<div class="np-av ' + state + '">'
-            + rings
-            + '<span>' + icon + '</span>'
-            + '</div>'
-            + '<div class="np-aname">' + label + '</div>'
-            + '<div class="np-abadge nb-' + state + '">' + badge + '</div>'
-            + '</div>'
+    if not st.session_state.doc_meta:
+        st.markdown(
+            '<div class="np-dropzone">'
+            '🧠 Drop a document to begin — PDF · DOCX · TXT'
+            '</div>',
+            unsafe_allow_html=True
         )
-    return '<div class="np-agents">' + ''.join(cards) + '</div>'
+    else:
+        m = st.session_state.doc_meta
+        st.markdown(
+            '<div class="np-upload">'
+            '<span style="font-size:22px">📄</span>'
+            '<div style="flex:1">'
+            f'<div class="np-upload-name">{m["name"]}</div>'
+            f'<div class="np-upload-meta">'
+            f'{m["chunks"]} chunks · {m["size_kb"]} KB · ready</div>'
+            '<div class="np-prog">'
+            '<div class="np-prog-fill"></div></div>'
+            '</div></div>',
+            unsafe_allow_html=True
+        )
 
-st.markdown(build_agent_cards(), unsafe_allow_html=True)
 
-st.markdown('<div class="sec-label">QUERY_INPUT PROMPT</div>', unsafe_allow_html=True)
+st.markdown('<div class="sec-label">QUERY INPUT</div>',
+            unsafe_allow_html=True)
 
-_mg_l, q_main, _mg_r = st.columns([0.055, 0.89, 0.055])
-with q_main:
-    _model_opts = ["llama3.2", "deepseek-r1", "qwen2.5:7b", "llama3.2:1b"]
-    _model_idx = (
-        _model_opts.index(st.session_state.selected_model)
-        if st.session_state.selected_model in _model_opts
-        else 0
-    )
-    col1, col2 = st.columns([5, 1])
-    query = col1.text_input(
-        "",
+col1, col2 = st.columns([5, 1])
+with col1:
+    # Load from history if clicked
+    if st.session_state.run_from_history:
+        query_input = st.session_state.run_from_history['query']
+        st.session_state.collection_name = st.session_state.run_from_history['collection']
+        st.session_state.run_from_history = None
+    else:
+        query_input = ""
+    
+    query = st.text_input(
+        "Query",
         placeholder="Ask something about your document...",
         label_visibility="collapsed",
         disabled=(st.session_state.collection_name is None),
-        key="query_input",
+        value=query_input,
+        key="query_input"
     )
-    run_btn = col2.button(
-        "Run Agents",
+with col2:
+    run_btn = st.button(
+        "▶ Run Agents",
         disabled=(st.session_state.collection_name is None),
-        use_container_width=True,
+        use_container_width=True
     )
-    st.caption("Model")
-    st.selectbox(
-        "Model",
-        _model_opts,
-        index=_model_idx,
-        label_visibility="collapsed",
-        key="selected_model",
-    )
+    if run_btn and query and st.session_state.collection_name:
+        st.session_state.should_run = True
 
-    if st.session_state.collection_name:
-        if st.button(
-            "⚡ Run All Agents (force)",
-            use_container_width=False
-        ):
-            # Force MULTI intent — runs reader+summariser+analyser+qa
-            st.session_state.last_query = (
-                query if query else
-                "Summarise and analyse this document fully."
-            )
-            st.session_state.run_count += 1
-            st.session_state.is_running = True
-            st.session_state.outputs = {
-                k: None for k in st.session_state.outputs
-            }
-            for k in st.session_state.agent_states:
-                st.session_state.agent_states[k] = (
-                    'active'
-                    if k in ['reader','summariser','analyser','qa']
-                    else 'idle'
-                )
-            st.rerun()
+model_opts = ["llama3.2", "deepseek-r1", "qwen2.5:7b", "llama3.2:1b"]
+model_idx = (model_opts.index(st.session_state.selected_model)
+             if st.session_state.selected_model in model_opts else 0)
+st.selectbox(
+    "Model",
+    model_opts,
+    index=model_idx,
+    label_visibility="collapsed",
+    key="selected_model"
+)
 
-INTENT_MAP = {
-    "SUMMARISE": ['reader', 'summariser'],
-    "ANALYSE":   ['reader', 'analyser'],
-    "QA":        ['reader', 'qa'],
-    "WRITE":     ['reader', 'summariser', 'writer'],
-    "MULTI":     ['reader', 'summariser', 'analyser', 'qa'],
-    "READ":      ['reader', 'summariser'],
-}
 
-DEFAULT_AGENTS = ['reader', 'summariser', 'analyser', 'qa']
+if st.session_state.should_run and query and st.session_state.collection_name:
 
-if run_btn and query and st.session_state.collection_name:
+    st.session_state.last_query  = query
+    st.session_state.run_count  += 1
+    st.session_state.outputs     = {
+        k: None for k in st.session_state.outputs
+    }
+    
+    # Reset all agents to idle first
+    for k in st.session_state.agent_states:
+        st.session_state.agent_states[k] = 'idle'
 
-    # reset state
-    st.session_state.last_query = query
-    st.session_state.run_count += 1
-    st.session_state.outputs = {k: None for k in st.session_state.outputs}
-    st.session_state.is_running = True
-
-    # detect intent
     try:
         intent = st.session_state.orchestrator.detect_intent(query)
-        if not intent or intent.strip() == "":
+        intent = str(intent).strip().upper()
+        valid  = ["SUMMARISE","ANALYSE","QA","WRITE","MULTI","READ"]
+        for v in valid:
+            if v in intent:
+                intent = v
+                break
+        else:
             intent = "MULTI"
-        intent = intent.strip().upper()
     except Exception:
         intent = "MULTI"
 
-    # Always fall back to MULTI if intent not in known map
-    VALID_INTENTS = ["SUMMARISE", "ANALYSE", "QA", "WRITE", "MULTI", "READ"]
-    if intent not in VALID_INTENTS:
-        intent = "MULTI"
+    selected = INTENT_MAP.get(intent,
+               ['reader', 'summariser', 'analyser'])
+    st.session_state.selected_agents = selected
 
-    selected_agents = INTENT_MAP.get(intent, DEFAULT_AGENTS)
-    if not selected_agents:
-        selected_agents = DEFAULT_AGENTS
-    st.session_state.selected_agents = selected_agents
+    # Set selected agents to active
+    for k in selected:
+        st.session_state.agent_states[k] = 'active'
 
-    # set all agent states
-    for k in st.session_state.agent_states:
-        st.session_state.agent_states[k] = (
-            'active' if k in selected_agents else 'idle'
-        )
+    predefined    = get_predefined_configs()
+    current_model = st.session_state.selected_model
+    vector_store  = st.session_state.vector_store
+    collection    = st.session_state.collection_name
 
-    # run each agent one by one with live spinner
-    predefined = get_predefined_configs()
+    def run_agent_task(agent_key):
+        """Execute single agent task and return result with timing"""
+        start_time = time.time()
+        cfg = predefined[agent_key]
+        lbl = AGENT_CONFIG[agent_key]['label']
 
-    for agent_key in selected_agents:
-        with st.spinner(f"🤖 {AGENT_CONFIG[agent_key]['label']} is working..."):
-            try:
-                try:
-                    hits = st.session_state.vector_store.search(
-                        query,
-                        st.session_state.collection_name,
-                        n_results=5
-                    )
-                except Exception:
-                    hits = []
-
-                if hits:
-                    context = "\n---\n".join(h["text"] for h in hits)
-                else:
-                    # Fall back — load all stored chunks directly
-                    all_chunks = st.session_state.vector_store.store.get(
-                        st.session_state.collection_name, []
-                    )
-                    context = "\n---\n".join(
-                        c["text"] for c in all_chunks[:5]
-                    ) if all_chunks else "No document content available."
-
-                if len(context) > 3000:
-                    context = context[:2997] + "..."
-                if not context.strip():
-                    context = "The document was uploaded but no text could be extracted."
-
-                cfg = predefined[agent_key]
-                task_desc = (
-                    "Document context:\n" + context +
-                    "\n\nTask: " + query
+        try:
+            hits = vector_store.search(
+                query,
+                collection,
+                n_results=5
+            )
+            if hits:
+                context = "\n---\n".join(
+                    h["text"] for h in hits
                 )
-                expected = (
-                    "A thorough well-structured response "
-                    "based only on the document context."
+            else:
+                all_docs = (
+                    vector_store.store.get(collection, [])
                 )
-                agent_obj, task_obj = build_crew_agent(
-                    cfg['role'], cfg['goal'], cfg['backstory'],
-                    task_desc, expected,
-                    model_name=st.session_state.selected_model
+                context = "\n---\n".join(
+                    c["text"] for c in all_docs[:5]
+                ) if all_docs else "No document content."
+
+            if len(context) > 3000:
+                context = context[:2997] + "..."
+
+            task_desc = (
+                f"Using ONLY the provided document context, answer this query: {query}\n\n"
+                f"Document Context:\n{context}\n\n"
+                f"Provide a direct, intelligent answer based on the document. "
+                f"Do not just repeat the document verbatim."
+            )
+            expected = (
+                "A thoughtful, well-reasoned response that directly answers the query "
+                "using information from the provided document context."
+            )
+            agent_obj, task_obj = build_crew_agent(
+                cfg["role"], cfg["goal"], cfg["backstory"],
+                task_desc, expected,
+                model_name=current_model
+            )
+            result = run_crew([(agent_obj, task_obj)])
+            
+            # Handle list result from run_crew
+            if isinstance(result, list):
+                result_str = result[0] if result else ""
+            else:
+                result_str = str(result)
+            
+            result_str = result_str.strip()
+
+            if not result_str or result_str.lower() in [
+                "none", "null", "", "[]", "n/a"
+            ]:
+                result_str = (
+                    f"{lbl} processed the document "
+                    "but returned no output. "
+                    "Try rephrasing your query."
                 )
-                result = run_crew([(agent_obj, task_obj)])
-                result_str = str(result).strip()
-                if not result_str or result_str.lower() in [
-                    "none", "null", "", "n/a"
-                ]:
-                    result_str = (
-                        f"The {AGENT_CONFIG[agent_key]['label']} agent "
-                        f"processed the document but returned no output. "
-                        f"Try rephrasing your query."
-                    )
+            
+            elapsed = time.time() - start_time
+            return agent_key, result_str, elapsed
+
+        except Exception as e:
+            elapsed = time.time() - start_time
+            return agent_key, (
+                f"⚠️ {lbl} error: {str(e)}"
+            ), elapsed
+
+    with st.spinner(f"🚀 Running {len(selected)} agents in parallel..."):
+        with ThreadPoolExecutor(max_workers=5) as executor:
+            futures = {
+                executor.submit(run_agent_task, agent_key): agent_key
+                for agent_key in selected
+            }
+
+            for future in as_completed(futures):
+                agent_key, result_str, elapsed = future.result()
                 st.session_state.outputs[agent_key] = result_str
+                st.session_state.agent_times[agent_key] = elapsed
+                st.session_state.agent_states[agent_key] = 'done'
 
-            except Exception as e:
-                st.session_state.outputs[agent_key] = (
-                    f"⚠️ Agent error: {str(e)}"
-                )
-
-        st.session_state.agent_states[agent_key] = 'done'
-
-    # update memory and token count
     st.session_state.memory.add_turn('user', query)
     combined = "\n\n---\n\n".join(
         v for v in st.session_state.outputs.values() if v
     )
     st.session_state.memory.add_turn('assistant', combined)
     st.session_state.token_count += (
-        len(query.split()) * 2 + 500 * len(selected_agents)
+        len(query.split()) * 2 + 500 * len(selected)
     )
-    st.session_state.is_running = False
-    st.rerun()
+    
+    # Add to query history
+    st.session_state.query_history.append({
+        'query': query,
+        'doc_name': st.session_state.doc_meta.get('name', '—'),
+        'collection_name': st.session_state.collection_name,
+        'timestamp': datetime.datetime.now().strftime("%H:%M")
+    })
+    
+    st.session_state.should_run = False
+
+
+# Agent Status Display (updated after execution)
+def build_agent_cards():
+    cards = []
+    for key in ['reader','summariser','analyser','qa','writer']:
+        state = st.session_state.agent_states[key]
+        icon  = AGENT_CONFIG[key]['icon']
+        label = AGENT_CONFIG[key]['label']
+        rings = (
+            '<div class="np-av-ring"></div>'
+            '<div class="np-av-ring2"></div>'
+        ) if state == 'active' else ''
+        badge = ('✓ DONE' if state == 'done' else
+                 'WORKING' if state == 'active' else
+                 'WAITING')
+        cards.append(
+            '<div class="np-agent ' + state + '">'
+            + '<div class="np-av ' + state + '">'
+            + rings + '<span>' + icon + '</span>'
+            + '</div>'
+            + '<div class="np-aname">' + label + '</div>'
+            + '<div class="np-abadge nb-' + state + '">'
+            + badge + '</div>'
+            + '</div>'
+        )
+    return ('<div class="np-agents">'
+            + ''.join(cards) + '</div>')
+
+# Show agent status if any agent has been run or is running
+if any(st.session_state.agent_states[k] != 'idle' for k in st.session_state.agent_states):
+    st.markdown('<div class="sec-label">AGENT STATUS</div>', unsafe_allow_html=True)
+    st.markdown(build_agent_cards(), unsafe_allow_html=True)
+
+
+# Display results if there are any completed agents (runs AFTER execution)
+completed_agents = [
+    k for k in st.session_state.outputs.keys() 
+    if st.session_state.outputs[k] and st.session_state.agent_states[k] == 'done'
+]
+
+if completed_agents:
+    st.success("✅ Query executed successfully!")
+    st.markdown('<div class="sec-label">EXECUTION RESULTS</div>', unsafe_allow_html=True)
+    
+    # Sort by execution time (fastest first)
+    sorted_agents = sorted(
+        completed_agents,
+        key=lambda k: st.session_state.agent_times.get(k, float('inf'))
+    )
+    
+    for agent_key in sorted_agents:
+        output_text = st.session_state.outputs[agent_key]
+        elapsed = st.session_state.agent_times.get(agent_key, 0)
+        icon = AGENT_CONFIG[agent_key]['icon']
+        label = AGENT_CONFIG[agent_key]['label']
+        
+        with st.expander(f"{icon} {label} ({elapsed:.1f}s)", expanded=True):
+            st.write(output_text)
+
+
+st.markdown('<div class="sec-label">OUTPUT FEED</div>',
+            unsafe_allow_html=True)
+
+with st.expander("🔍 Debug Info", expanded=False):
+    st.write(f"**Agent States:** {st.session_state.agent_states}")
+    st.write(f"**Agent Times (s):** {dict((k, f'{v:.1f}s') for k, v in st.session_state.agent_times.items())}")
+    st.write(f"**Outputs Keys:** {list(st.session_state.outputs.keys())}")
+    for k, v in st.session_state.outputs.items():
+        if v:
+            st.write(f"**{k}:** {v[:100]}...")
 
 def build_output_cards():
-    descriptions = {
-        'reader':     'raw document extract',
-        'summariser': 'structured summary',
-        'analyser':   'critical analysis',
-        'qa':         'question answer',
-        'writer':     'generated document'
-    }
-    cards_html = '<div class="np-out-stack">'
-    for key in ['reader', 'summariser', 'analyser', 'qa', 'writer']:
+    cards = []
+    for key in ['reader','summariser','analyser','qa','writer']:
         state  = st.session_state.agent_states[key]
-        output = st.session_state.outputs.get(key)
-        icon   = AGENT_CONFIG[key]['icon']
-        label  = AGENT_CONFIG[key]['label']
-        desc   = descriptions[key]
-
+        cfg    = AGENT_CONFIG[key]
+        elapsed = st.session_state.agent_times.get(key, 0)
+        status = ('COMPLETE'    if state == 'done'   else
+                  'IN PROGRESS' if state == 'active' else
+                  'WAITING')
+        time_badge = f'<span style="font-size:10px; color:#8b7cfa;">{elapsed:.1f}s</span>' if state == 'done' and elapsed > 0 else ''
+        body = ''
         if state == 'active':
-            status_text = 'IN PROGRESS'
-        elif state == 'done':
-            status_text = 'COMPLETE'
-        else:
-            status_text = 'WAITING'
-
+            body = (
+                '<div class="np-obody">'
+                + '<div class="shim-line" style="width:100%"></div>'
+                + '<div class="shim-line" style="width:75%"></div>'
+                + '<div class="shim-line" style="width:100%"></div>'
+                + '<div class="shim-line" style="width:55%"></div>'
+                + '</div>'
+            )
         card = (
             '<div class="np-ocard ' + state + '">'
             + '<div class="np-ohead">'
-            + '<div class="np-oicon">' + icon + '</div>'
-            + '<span class="np-otitle">' + label + ' — ' + desc + '</span>'
-            + '<span class="np-ostatus os-' + state + '">' + status_text + '</span>'
+            + '<div class="np-oicon oi-' + state + '">'
+            + cfg['icon'] + '</div>'
+            + '<span class="np-otitle">'
+            + cfg['label'] + ' — ' + cfg['desc'] + '</span>'
+            + time_badge
+            + '<span class="np-ostatus os-' + state + '">'
+            + status + '</span>'
+            + '</div>'
+            + body
             + '</div>'
         )
+        cards.append(card)
+    return ('<div class="np-out-stack">'
+            + ''.join(cards) + '</div>')
 
-        if state == 'active':
-            card += (
-                '<div class="np-obody">'
-                + '<div class="shimmer-line f"></div>'
-                + '<div class="shimmer-line m"></div>'
-                + '<div class="shimmer-line f"></div>'
-                + '<div class="shimmer-line s"></div>'
-                + '</div>'
-            )
-        else:
-            card += '<div class="np-obody"></div>'
-
-        card += '</div>'
-        cards_html += card
-
-    cards_html += '</div>'
-    return cards_html
-
-st.markdown('<div class="sec-label">OUTPUT_FEED RESULTS</div>',
-            unsafe_allow_html=True)
 st.markdown(build_output_cards(), unsafe_allow_html=True)
 
-# Render actual output content using native Streamlit expanders
-# (these go AFTER the HTML cards, not inside them)
-for key in ['reader', 'summariser', 'analyser', 'qa', 'writer']:
-    state  = st.session_state.agent_states[key]
+# Sort by completion time (fastest first)
+sorted_agents = sorted(
+    [k for k in ['reader','summariser','analyser','qa','writer']
+     if st.session_state.agent_states.get(k) == 'done' and st.session_state.outputs.get(k)],
+    key=lambda k: st.session_state.agent_times.get(k, float('inf'))
+)
+
+has_outputs = False
+for key in sorted_agents:
     output = st.session_state.outputs.get(key)
+    state  = st.session_state.agent_states.get(key)
     if state == 'done' and output:
-        icon  = AGENT_CONFIG[key]['icon']
-        label = AGENT_CONFIG[key]['label']
-        with st.expander(icon + '  ' + label + ' output', expanded=True):
-            st.markdown(output)
+        has_outputs = True
+        cfg = AGENT_CONFIG[key]
+        elapsed = st.session_state.agent_times.get(key, 0)
+        expander_label = f"{cfg['icon']}  {cfg['label']} output  •  {elapsed:.1f}s"
+        with st.expander(expander_label, expanded=True):
+            st.markdown(str(output))
+
+if not has_outputs and any(st.session_state.agent_states.get(k) == 'done' for k in st.session_state.agent_states):
+    st.info("⏳ Outputs are being processed... Please wait or try running again.")
 
 
-if any(st.session_state.outputs.values()):
-    export_md = f"# Doc Dream Team — Session Export\n"
-    export_md += f"**Document:** {st.session_state.doc_meta.get('name','—')}\n"
-    export_md += f"**Query:** {st.session_state.last_query}\n\n"
-    for key, output in st.session_state.outputs.items():
-        if output:
-            export_md += f"## {AGENT_CONFIG[key]['label']}\n{output}\n\n"
-    st.download_button("Export session", export_md,
-                       file_name="session.md", mime="text/markdown")
+if any(v for v in st.session_state.outputs.values()):
+    export = (
+        "# Doc Dream Team — Session Export\n\n"
+        f"**Document:** {st.session_state.doc_meta.get('name','—')}\n"
+        f"**Query:** {st.session_state.last_query}\n\n"
+    )
+    for k, v in st.session_state.outputs.items():
+        if v:
+            export += (
+                f"## {AGENT_CONFIG[k]['label']}\n{v}\n\n"
+            )
+    st.download_button(
+        "⬇ Export session",
+        export,
+        file_name="session.md",
+        mime="text/markdown"
+    )

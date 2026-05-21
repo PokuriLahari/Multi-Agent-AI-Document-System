@@ -22,8 +22,8 @@ class VectorStore:
         if not keys:
             return 0.0
         dot = sum(a[k] * b[k] for k in keys)
-        mag_a = math.sqrt(sum(v*v for v in a.values()))
-        mag_b = math.sqrt(sum(v*v for v in b.values()))
+        mag_a = math.sqrt(sum(v * v for v in a.values()))
+        mag_b = math.sqrt(sum(v * v for v in b.values()))
         if mag_a == 0 or mag_b == 0:
             return 0.0
         return dot / (mag_a * mag_b)

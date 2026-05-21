@@ -1,5 +1,5 @@
 from langchain_ollama import OllamaLLM
-
+from config import OLLAMA_BASE_URL
 
 class BaseAgent:
     def __init__(self, name: str, system_prompt: str, model: str = "llama3.2"):
@@ -9,7 +9,7 @@ class BaseAgent:
 
     def run(self, user_message: str, context: str = "") -> str:
         try:
-            llm = OllamaLLM(model=self.model_name, base_url="http://localhost:11434")
+            llm = OllamaLLM(model=self.model_name, base_url=OLLAMA_BASE_URL)
             full_prompt = f"{self.system_prompt}\n\nContext:\n{context}\n\nUser: {user_message}"
             response = llm.invoke(full_prompt)
             return response

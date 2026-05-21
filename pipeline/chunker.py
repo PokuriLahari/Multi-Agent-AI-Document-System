@@ -22,12 +22,16 @@ def chunk_document(file_path: str) -> list[dict]:
     encoding = tiktoken.get_encoding("cl100k_base")
 
     chunks = []
+    chunk_size = 500
+    overlap = 50
+    step = chunk_size - overlap
+
     for block_text, position_info in text_blocks:
         tokens = encoding.encode(block_text)
 
-        for i in range(0, len(tokens), 500):
-            chunk_tokens = tokens[i : i + 500]
-            chunk_text = tiktoken.get_encoding("cl100k_base").decode(chunk_tokens)
+        for i in range(0, len(tokens), step):
+            chunk_tokens = tokens[i : i + chunk_size]
+            chunk_text = encoding.decode(chunk_tokens)
 
             chunks.append(
                 {

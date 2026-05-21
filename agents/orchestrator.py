@@ -4,7 +4,7 @@ from agents.summariser import SummariserAgent
 from agents.analyser import AnalyserAgent
 from agents.qa_agent import QAAgent
 from agents.writer import WriterAgent
-from agents.crew_builder import build_crew_agent, run_crew, get_predefined_configs
+from agents.crew_builder import build_agent, build_task, run_crew, PREDEFINED_CONFIGS, CrewExecutionError
 from pipeline.embedder import VectorStore
 
 
@@ -19,9 +19,10 @@ class OrchestratorAgent(BaseAgent):
         VALID = ["SUMMARISE", "ANALYSE", "QA", "WRITE", "MULTI", "READ"]
         try:
             from langchain_ollama import OllamaLLM
+            from config import OLLAMA_BASE_URL
             llm = OllamaLLM(
                 model=self.model_name,
-                base_url="http://localhost:11434"
+                base_url=OLLAMA_BASE_URL
             )
             prompt = (
                 "Classify this request into exactly one of these "
@@ -129,7 +130,7 @@ class OrchestratorAgent(BaseAgent):
             }
             selected_agents = intent_to_agents.get(detected_intent, ["qa"])
 
-        predefined_configs = get_predefined_configs()
+        predefined_configs = PREDEFINED_CONFIGS
         agents_and_tasks = []
 
         for agent_key in selected_agents:
@@ -138,16 +139,22 @@ class OrchestratorAgent(BaseAgent):
                 task_desc = f"Document context:\n{context}\n\nTask: {user_message}"
                 expected = "A thorough, well-structured response based only on the document context"
 
-                agent, task = build_crew_agent(
+                agent = build_agent(
                     role=config["role"],
                     goal=config["goal"],
-                    backstory=config["backstory"],
+                    backstory=config["backstory"]
+                )
+                task = build_task(
                     task_description=task_desc,
-                    expected_output=expected
+                    expected_output=expected,
+                    agent=agent
                 )
                 agents_and_tasks.append((agent, task))
 
-        result = run_crew(agents_and_tasks)
+        try:
+            result = run_crew(agents_and_tasks)
+        except CrewExecutionError as e:
+            result = [str(e)]
 
         return {
             "intent": detected_intent,
