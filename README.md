@@ -277,12 +277,6 @@ Contributions welcome! Areas for enhancement:
 
 ---
 
-## 📄 License
-
-MIT License — Feel free to use for personal or commercial projects.
-
----
-
 ## 🙋 Support
 
 For issues or questions:
